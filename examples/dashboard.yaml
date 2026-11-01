@@ -1,0 +1,27 @@
+title: Pack-In
+views:
+  - title: Family
+    path: family
+    icon: mdi:home-heart
+    cards:
+      - type: todo-list
+        title: Chores
+        entity: todo.test_family_your_chores
+      - type: todo-list
+        title: Groceries
+        entity: todo.test_family_groceries
+      - type: calendar
+        title: Calendar
+        initial_view: listWeek
+        entities:
+          - calendar.test_family_calendar
+      - type: map
+        title: Find Me
+        hours_to_show: 0
+        entities:
+          - device_tracker.test_family_alex_location
+      - type: entities
+        title: Connection
+        entities:
+          - sensor.test_family_synchronization
+          - button.test_family_refresh_locations

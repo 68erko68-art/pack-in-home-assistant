@@ -1,0 +1,38 @@
+# Examples only. Replace entity IDs and choose your own notification destination.
+# Nothing is enabled automatically.
+- alias: Add milk to Pack-In
+  triggers:
+    - trigger: event
+      event_type: family_add_milk
+  actions:
+    - action: todo.add_item
+      target:
+        entity_id: todo.test_family_groceries
+      data:
+        item: Milk
+  mode: single
+
+- alias: Pack-In shopping finished
+  triggers:
+    - trigger: numeric_state
+      entity_id: todo.test_family_groceries
+      below: 1
+  actions:
+    - action: persistent_notification.create
+      data:
+        title: Pack-In
+        message: Everything on the shopping list has been bought.
+  mode: single
+
+- alias: Upcoming Pack-In event
+  triggers:
+    - trigger: calendar
+      entity_id: calendar.test_family_calendar
+      event: start
+      offset: "-00:15:00"
+  actions:
+    - action: persistent_notification.create
+      data:
+        title: Pack-In
+        message: "{{ trigger.calendar_event.summary }} starts in 15 minutes."
+  mode: single

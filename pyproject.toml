@@ -1,0 +1,20 @@
+[project]
+name = "pack-in-home-assistant"
+version = "0.1.0b1"
+description = "End-to-end encrypted Pack-In integration for Home Assistant"
+requires-python = ">=3.14.2"
+license = "MIT"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py314"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.format]
+quote-style = "double"

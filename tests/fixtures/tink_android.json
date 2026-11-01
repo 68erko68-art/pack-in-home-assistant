@@ -1,0 +1,16 @@
+{
+  "synthetic": true,
+  "oracle": "Canonical Android dependency com.google.crypto.tink:tink-android:1.22.0; actual Kotlin source acceptance is a separate gate",
+  "context": {
+    "pack": "ha-synthetic-pack",
+    "event": "ha-synthetic-event",
+    "device": "ha-synthetic-android",
+    "sequence": 11,
+    "event_type": "chore.upserted",
+    "epoch": 7
+  },
+  "clear": "eyJpZCI6InN5bnRoZXRpYy1jaG9yZSIsInRpdGxlIjoiQ29tcGF0aWJpbGl0eSB2ZWN0b3IiLCJwYWNrSWQiOiJoYS1zeW50aGV0aWMtcGFjayJ9",
+  "pack_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  "signing_public": "CIvku9QJEpYBCokBCjV0eXBlLmdvb2dsZWFwaXMuY29tL2dvb2dsZS5jcnlwdG8udGluay5FY2RzYVB1YmxpY0tleRJOEgYIAxACGAIaIQD7RDLrQbYyLjP_gxHevXQOx-23BcOCZj4vdTIG1-8xRyIhAPSAjt6-0fI6UClWqw_MnEvc4OQHyNGr0vTxUgxDEoFVGAMQARiL5LvUCSAB",
+  "envelope": "1.7.gQ7IpQSDMhJW5_6c.bi3HLVyDKJMDNI-x-g8z-Jz9jI5T1ujoxNrJWYSckcI84Ma1rPcdtnRXCpVHE8xICAaVJV311b81BaNBYQpBkfEhzauX2vd9irT-xJ71jDLF00LgD9YHYSOE4T8CRu6e4mP8WQ.AZqO8gswRQIgdsd2p2CnNdNpG1YiApi79f8uYxy28xp84fUzZKOyDXMCIQCIu22pQ6BG8yBZCUCN7EtT43jO29dDh6sm2qTy1TrODw"
+}

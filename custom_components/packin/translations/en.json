@@ -1,0 +1,44 @@
+{
+  "title": "Pack-In",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect Pack-In",
+        "description": "Approve this Home Assistant in the Pack-In phone app. The linking account needs Premium. Every member controls whether their location is shared with this home.",
+        "data": {
+          "name": "Home name",
+          "read_only": "Read-only connection",
+          "find_me": "Enable Find Me (members must consent)"
+        }
+      },
+      "pair": {
+        "title": "Approve on your phone",
+        "description": "In Pack-In, open Settings \u2192 Connected homes \u2192 Connect a home. Enter **{code}**, select a Pack and review its permissions. Then select Submit here. This code expires after 5 minutes. Connection fingerprint: {fingerprint}."
+      }
+    },
+    "error": {
+      "unavailable": "Pack-In could not be reached. Check your connection and try again.",
+      "rate_limited": "Please wait before trying again.",
+      "approval_pending": "Approval is still pending. Approve this home in Pack-In first."
+    },
+    "abort": {
+      "pairing_expired": "The code expired. Start setup again.",
+      "pairing_denied": "This pairing was denied or has already been used.",
+      "wrong_pack": "Choose the same Pack when reconnecting this entry.",
+      "already_configured": "This Pack is already connected.",
+      "reauth_successful": "Pack-In was reconnected.",
+      "reconfigure_successful": "The connection was changed."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Find Me",
+        "description": "One shared location request per Pack at this interval. Disabled stops location retrieval. Tasks, groceries and calendar use a shared real-time connection.",
+        "data": {
+          "location_interval": "Location retrieval interval (minutes; 0 disables)"
+        }
+      }
+    }
+  }
+}

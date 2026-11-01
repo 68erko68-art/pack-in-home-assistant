@@ -1,0 +1,14 @@
+{
+  "domain": "packin",
+  "name": "Pack-In",
+  "version": "0.1.0-beta.1",
+  "codeowners": [
+    "@68erko68-art"
+  ],
+  "config_flow": true,
+  "documentation": "https://github.com/68erko68-art/pack-in-home-assistant",
+  "integration_type": "hub",
+  "iot_class": "cloud_push",
+  "issue_tracker": "https://github.com/68erko68-art/pack-in-home-assistant/issues",
+  "requirements": []
+}

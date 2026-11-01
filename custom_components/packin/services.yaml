@@ -1,0 +1,55 @@
+assign_task:
+  name: Assign task
+  description: Assign open work to current Pack members. An empty list makes it available to anyone.
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        config_entry:
+          integration: packin
+    item_id:
+      required: true
+      selector:
+        text:
+    member_ids:
+      required: true
+      description: Stable Pack member IDs. Use an empty list to unassign.
+      selector:
+        object:
+set_quantity:
+  name: Set grocery quantity
+  description: Change the quantity without losing category, assignment or purchase history.
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        config_entry:
+          integration: packin
+    item_id:
+      required: true
+      selector:
+        text:
+    quantity:
+      required: true
+      selector:
+        text:
+add_grocery:
+  name: Add grocery
+  description: Add an item to the Pack's shared groceries or a selected shared list.
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        config_entry:
+          integration: packin
+    name:
+      required: true
+      selector:
+        text:
+    quantity:
+      selector:
+        text:
+    list_id:
+      description: Omit to use the Pack's permanent shared groceries.
+      selector:
+        text:
