@@ -420,3 +420,56 @@ def test_new_member_consent_refreshes_roster_once_without_member_polling():
             await session.close()
 
     run(scenario())
+
+
+def test_failed_key_request_can_recover_and_success_is_coalesced():
+    async def scenario():
+        session, client, _, _, _ = await client_fixture()
+        calls = []
+
+        async def request_key(epoch):
+            calls.append(epoch)
+            if len(calls) == 1:
+                raise PackInApiError("temporary_failure", 503, 60)
+
+        client.api.request_key = request_key
+        try:
+            with pytest.raises(PackInApiError):
+                await client._hold_for_key(2)
+            assert client._waiting_epoch == 2 and 2 not in client._key_requested
+            assert not client.available
+            await client._hold_for_key(2)
+            await client._hold_for_key(2)
+            assert calls == [2, 2] and 2 in client._key_requested
+        finally:
+            await session.close()
+
+    run(scenario())
+
+
+def test_key_ready_only_resumes_when_the_needed_epoch_is_installed():
+    async def scenario():
+        session, client, _, sent, _ = await client_fixture()
+        calls = []
+
+        async def request_key(epoch):
+            calls.append(epoch)
+
+        async def refresh_keys():
+            return None
+
+        client.api.request_key = request_key
+        client.api.refresh_keys = refresh_keys
+        try:
+            await client._hold_for_key(2)
+            await client._frame(json.dumps({"type": "HOME_ASSISTANT_KEYS_READY"}))
+            assert client._waiting_key and not sent
+            client.api.data["pack_keys"]["2"] = encode64(b"n" * 32)
+            await client._frame(json.dumps({"type": "HOME_ASSISTANT_KEYS_READY"}))
+            assert not client._waiting_key and client._waiting_epoch is None
+            assert sent == [{"type": "RESUME", "afterSequence": 0}]
+            assert calls == [2]
+        finally:
+            await session.close()
+
+    run(scenario())

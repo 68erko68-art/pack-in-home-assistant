@@ -80,6 +80,7 @@ class PackClient:
         self._save_lock = asyncio.Lock()
         self._actions = asyncio.Lock()
         self._location_lock = asyncio.Lock()
+        self._key_request_lock = asyncio.Lock()
         self._wake_locations = asyncio.Event()
         self._last_location_attempt = 0.0
         self._last_metadata_attempt = 0.0
@@ -88,6 +89,7 @@ class PackClient:
         self._connection_id = ""
         self._key_requested: set[int] = set()
         self._waiting_key = False
+        self._waiting_epoch: int | None = None
         self._blocked = bool(data.get("reauth_reason"))
         self._workflow_task: asyncio.Task | None = None
 
@@ -169,6 +171,22 @@ class PackClient:
             await self._ws.close()
         self.auth_failed(code)
         self._notify()
+
+    async def _request_epoch_once(self, epoch: int) -> None:
+        async with self._key_request_lock:
+            if epoch not in self._key_requested:
+                # A failed or lost request remains eligible for bounded recovery.
+                await self.api.request_key(epoch)
+                self._key_requested.add(epoch)
+
+    async def _hold_for_key(self, epoch: int) -> None:
+        self._waiting_key = True
+        self._waiting_epoch = epoch
+        self._ready.clear()
+        self.log.abort_snapshot()
+        self.status = "waiting_for_phone"
+        self._notify()
+        await self._request_epoch_once(epoch)
 
     async def _send(self, value: dict[str, Any]) -> None:
         if self._ws is None or self._ws.closed:
@@ -279,7 +297,11 @@ class PackClient:
             return
         if kind == "HOME_ASSISTANT_KEYS_READY":
             await self.api.refresh_keys()
+            if self._waiting_epoch is not None and self._waiting_epoch not in self.keys():
+                await self._hold_for_key(self._waiting_epoch)
+                return
             self._waiting_key = False
+            self._waiting_epoch = None
             self.log.reset_connection()
             await self._send({"type": "RESUME", "afterSequence": self.state.last_sequence})
             return
@@ -289,6 +311,8 @@ class PackClient:
                 self.api.data["key_epoch"] = epoch
                 await self.api._save()
             await self.api.refresh_keys()
+            if type(epoch) is int and epoch not in self.keys():
+                await self._hold_for_key(epoch)
             return
         if self._waiting_key:
             return
@@ -329,6 +353,14 @@ class PackClient:
                 self._connection_id = uuid4().hex
                 self._sent_connection = None
                 self.log.reset_connection()
+                if self._waiting_epoch is not None:
+                    if self._waiting_epoch not in self.keys():
+                        await self.api.refresh_keys()
+                    if self._waiting_epoch in self.keys():
+                        self._waiting_key = False
+                        self._waiting_epoch = None
+                    else:
+                        await self._hold_for_key(self._waiting_epoch)
                 self._ws = await self.api.websocket()
                 self.metrics["connections"] += 1
                 close_reason = ""
@@ -338,14 +370,7 @@ class PackClient:
                         try:
                             await self._frame(message.data)
                         except MissingKey as exc:
-                            self._waiting_key = True
-                            self._ready.clear()
-                            self.log.abort_snapshot()
-                            self.status = "waiting_for_phone"
-                            if exc.epoch not in self._key_requested:
-                                self._key_requested.add(exc.epoch)
-                                await self.api.request_key(exc.epoch)
-                            self._notify()
+                            await self._hold_for_key(exc.epoch)
                     elif message.type == aiohttp.WSMsgType.ERROR:
                         raise PackInApiError("connection_unavailable")
                     elif message.type in {aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING}:
@@ -370,6 +395,10 @@ class PackClient:
                 if exc.auth_failed:
                     await self._deny(exc.code)
                     break
+                if exc.status in (400, 404, 410, 422):
+                    self._blocked = True
+                    self.status = "attention_required"
+                    self._notify()
             except (
                 CryptoError,
                 InvalidSignature,
@@ -490,11 +519,15 @@ class PackClient:
                     await self._deny(exc.code)
                     return
             except MissingKey as exc:
-                if exc.epoch not in self._key_requested:
-                    self._key_requested.add(exc.epoch)
-                    await self.api.request_key(exc.epoch)
+                try:
+                    await self._request_epoch_once(exc.epoch)
+                    self.error = "location_key_required"
+                except PackInApiError as problem:
+                    self.error = problem.code
+                    if problem.auth_failed:
+                        await self._deny(problem.code)
+                        return
                 self.locations.clear()
-                self.error = "location_key_required"
             except (CryptoError, InvalidSignature, InvalidTag, ValueError, KeyError):
                 self.locations.clear()
                 self.error = "location_integrity_failed"
