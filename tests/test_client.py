@@ -3,6 +3,7 @@
 import asyncio
 from copy import deepcopy
 from datetime import datetime, timezone
+import hashlib
 import json
 
 import aiohttp
@@ -11,6 +12,7 @@ import pytest
 from packin_pure.api import PackInApi, PackInApiError, SCOPES
 from packin_pure.client import PackClient, ActionPending, Conflict
 from packin_pure.crypto import DeviceIdentity, encode64
+from packin_pure.protocol import CAPABILITIES, descriptor
 from packin_pure.state import PermissionDenied, occurrence
 
 
@@ -467,8 +469,299 @@ def test_key_ready_only_resumes_when_the_needed_epoch_is_installed():
             client.api.data["pack_keys"]["2"] = encode64(b"n" * 32)
             await client._frame(json.dumps({"type": "HOME_ASSISTANT_KEYS_READY"}))
             assert not client._waiting_key and client._waiting_epoch is None
-            assert sent == [{"type": "RESUME", "afterSequence": 0}]
+            assert sent == [{"type": "SNAPSHOT"}]
             assert calls == [2]
+        finally:
+            await session.close()
+
+    run(scenario())
+
+
+def hello(client, epoch=None, head=7):
+    return json.dumps({
+        "type": "HELLO",
+        "packId": client.state.pack_id,
+        "deviceId": client.api.data["connection_id"],
+        "userId": client.state.user_id,
+        "protocolVersion": 3,
+        "syncGeneration": 3,
+        "authorityMode": "v3",
+        "dataEpoch": client.state.data_epoch if epoch is None else epoch,
+        "headSequence": head,
+        "nextDeviceSequence": 1,
+        "capabilities": CAPABILITIES,
+    })
+
+
+def restarted_client(client, cache):
+    return PackClient(
+        client.api, cache, client.persist, client.changed, client.auth_failed,
+        lambda coro, name: asyncio.create_task(coro, name=name),
+    )
+
+
+async def snapshot_row(client, *, complete=True, item=None):
+    """A real full-ledger boundary containing a previous-epoch legacy row."""
+    async def decrypt(frame):
+        return task() if item is None else deepcopy(item)
+
+    client.log._decrypt = decrypt
+    row = {
+        "type": "SNAPSHOT_ROW", "snapshotKind": "EVENT_LOG_V1",
+        "protocolVersion": 3, "syncGeneration": 3,
+        "packId": client.state.pack_id, "dataEpoch": client.state.data_epoch,
+        "originalDataEpoch": client.state.data_epoch - 1,
+        "serverSequence": 1, "eventId": "legacy-event",
+        "actorUserId": "user-a", "actorDeviceId": "phone-a",
+        "eventType": "chore.upserted", "entityType": "legacy_envelope",
+        "entityId": "legacy-event", "entityVersion": 1,
+        "serverTimestamp": "2026-11-01T23:00:00Z",
+    }
+    raw = json.dumps(row)
+    boundary = {
+        "snapshotKind": "EVENT_LOG_V1", "snapshotDigestAlgorithm": "SHA-256-JSONL",
+        "dataEpoch": client.state.data_epoch, "snapshotHeadSequence": 1,
+        "rowCount": 1, "snapshotId": "snapshot-one",
+        "snapshotDigest": hashlib.sha256((raw + "\n").encode()).hexdigest(),
+    }
+    await client._frame(json.dumps({"type": "SNAPSHOT_BEGIN", **boundary}))
+    await client._frame(raw)
+    if complete:
+        await client._frame(json.dumps({"type": "SNAPSHOT_COMPLETE", **boundary}))
+        await client._frame(json.dumps({
+            "type": "SYNC_COMPLETE", "headSequence": 1,
+            "lastSequence": 1, "hasMore": False,
+        }))
+
+
+def test_first_connection_snapshots_small_previous_epoch_ledger_and_persists_verified_bootstrap():
+    async def scenario():
+        session, client, saved, sent, _ = await client_fixture()
+        try:
+            await client._frame(hello(client, epoch=2, head=1))
+            assert sent == [{"type": "SNAPSHOT", "capabilities": CAPABILITIES}]
+            await snapshot_row(client)
+            assert client.state.chores["task-a"]["title"] == "Feed the dog"
+            assert client.state.last_sequence == 1 and client.available
+            assert saved[-1]["bootstrap_verified"] is True
+            assert len(sent) == 1  # Never RESUME 0 repeatedly for omitted old-epoch rows.
+
+            restarted = restarted_client(client, saved[-1])
+            restarted._send = client._send
+            await restarted._frame(hello(restarted, head=1))
+            assert sent[-1] == {"type": "RESUME", "afterSequence": 1, "capabilities": CAPABILITIES}
+        finally:
+            await session.close()
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("sequence,marker", [(12, None), (12, True), (0, True)])
+def test_healthy_cached_restart_and_offline_reconnect_resume_without_full_snapshot(sequence, marker):
+    async def scenario():
+        session, client, _, sent, _ = await client_fixture()
+        try:
+            client.state.last_sequence = sequence
+            if sequence:
+                client.state.chores["task-a"] = task()
+            cache = {"state": client.state.export(), "outbox": {"wire": {"eventId": "pending-action"}}}
+            if marker is not None:
+                cache["bootstrap_verified"] = marker
+            restarted = restarted_client(client, cache)
+            restarted._send = client._send
+            await restarted._frame(hello(restarted, head=sequence + 2))
+            assert sent == [{"type": "RESUME", "afterSequence": sequence, "capabilities": CAPABILITIES}]
+            assert restarted.outbox == cache["outbox"]
+            assert restarted.state.chores == client.state.chores
+
+            # A dropped transport must keep the same verified cursor and queued action.
+            restarted.log.reset_connection()
+            await restarted._frame(hello(restarted, head=sequence + 3))
+            assert sent[-1] == sent[0] and len(sent) == 2
+            assert restarted.outbox == cache["outbox"]
+        finally:
+            await session.close()
+
+    run(scenario())
+
+
+def test_hello_epoch_change_cancels_old_action_and_bootstraps_snapshot():
+    async def scenario():
+        session, client, saved, sent, _ = await client_fixture()
+        try:
+            client.state.last_sequence = 12
+            client.state.chores["task-a"] = task()
+            client.outbox = {"wire": {"eventId": "old-action"}}
+            client._needs_snapshot = False
+            await client._frame(hello(client, epoch=2, head=12))
+            assert sent == [{"type": "SNAPSHOT", "capabilities": CAPABILITIES}]
+            assert not client.state.chores and client.state.last_sequence == 0
+            assert client.outbox is None and saved[-1]["bootstrap_verified"] is False
+        finally:
+            await session.close()
+
+    run(scenario())
+
+
+def test_metadata_epoch_recovery_also_requires_snapshot_on_next_hello():
+    async def scenario():
+        session, client, saved, sent, _ = await client_fixture()
+        try:
+            client.state.last_sequence = 12
+            client._needs_snapshot = False
+
+            async def metadata():
+                client.api.data["data_epoch"] = 2
+                return {"authorityMode": "v3", "protocolVersion": 3, "syncGeneration": 3, "dataEpoch": 2}
+
+            client.api.metadata = metadata
+            assert await client._recover_handshake()
+            assert saved[-1]["bootstrap_verified"] is False
+            await client._frame(hello(client, head=12))
+            assert sent == [{"type": "SNAPSHOT", "capabilities": CAPABILITIES}]
+        finally:
+            await session.close()
+
+    run(scenario())
+
+
+def test_interrupted_snapshot_does_not_publish_partial_state_or_resume_as_verified_cache():
+    async def scenario():
+        session, client, saved, sent, _ = await client_fixture()
+        try:
+            await client._frame(hello(client, epoch=2, head=1))
+            await snapshot_row(client, complete=False)
+            assert not client.state.chores and client.state.last_sequence == 0
+            await client._save()
+            assert saved[-1]["bootstrap_verified"] is False
+
+            restarted = restarted_client(client, saved[-1])
+            restarted._send = client._send
+            await restarted._frame(hello(restarted, head=1))
+            assert sent[-1] == {"type": "SNAPSHOT", "capabilities": CAPABILITIES}
+            assert not restarted.state.chores
+        finally:
+            await session.close()
+
+    run(scenario())
+
+
+def test_missing_key_during_server_requested_snapshot_restarts_snapshot_not_partial_replay():
+    async def scenario():
+        session, client, _, sent, _ = await client_fixture()
+        try:
+            client.state.last_sequence = 12
+            client._needs_snapshot = False
+
+            async def request_key(epoch):
+                return None
+
+            async def refresh_keys():
+                return None
+
+            client.api.request_key = request_key
+            client.api.refresh_keys = refresh_keys
+            await client._frame(json.dumps({"type": "SNAPSHOT_REQUIRED"}))
+            assert sent == [{"type": "SNAPSHOT"}]
+            await client._hold_for_key(2)
+            client.api.data["pack_keys"]["2"] = encode64(b"n" * 32)
+            await client._frame(json.dumps({"type": "HOME_ASSISTANT_KEYS_READY"}))
+            assert sent[-1] == {"type": "SNAPSHOT"}
+            assert client.state.last_sequence == 12
+        finally:
+            await session.close()
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("assignee,allowed", [(None, True), ("user-b", False)])
+def test_legacy_snapshot_zero_revision_keeps_assignment_permissions_for_first_v3_edit(assignee, allowed):
+    async def scenario():
+        session, client, _, sent, _ = await client_fixture()
+        try:
+            await client._frame(hello(client, epoch=2, head=1))
+            item = task(
+                assigneeUserId=assignee,
+                assignmentMode="MEMBER" if assignee else "UNASSIGNED",
+                extensionFromPhone={"keep": True},
+            )
+            await snapshot_row(client, item=item)
+            # Legacy event IDs never masquerade as canonical entity revisions.
+            _, wire_id, _ = descriptor("chore.upserted", item)
+            assert client.state.revisions.get("chore:" + wire_id, 0) == 0
+            client.log._decrypt = client.log._decode
+            if allowed:
+                await client.update_task("task-a", {"completed": True})
+                mutation = sent[-1]
+                assert mutation["type"] == "MUTATE"
+                assert mutation["baseRevision"] == 0 and mutation["expectedPackSequence"] == 1
+                assert client.state.revisions["chore:" + wire_id] == 1
+                assert client.state.chores["task-a"]["completedByUserId"] == "user-a"
+                assert client.state.chores["task-a"]["extensionFromPhone"] == {"keep": True}
+            else:
+                with pytest.raises(PermissionDenied):
+                    await client.update_task("task-a", {"completed": True})
+                assert not any(value["type"] == "MUTATE" for value in sent)
+                assert client.state.chores["task-a"]["assigneeUserId"] == "user-b"
+        finally:
+            await session.close()
+
+    run(scenario())
+
+
+def test_signed_own_forbidden_completion_settles_rejected_and_never_success_or_workflow_retry():
+    async def scenario():
+        session, client, saved, _, _ = await client_fixture()
+        try:
+            original = task(assignmentMode="MEMBER", assigneeUserId="user-b")
+            client.state.chores["task-a"] = deepcopy(original)
+            kind, wire_id, operation = descriptor("chore.upserted", original)
+            client.state.last_sequence = 1
+            client.state.revisions[kind + ":" + wire_id] = 1
+            payload = {**original, "completedAt": 1793570400000, "completedByUserId": "user-a"}
+            event_id = "haevent-forbidden"
+            encoded = client.api.identity.encrypt_event(
+                json.dumps(payload).encode(), b"k" * 32, pack="pack-a", event=event_id,
+                device=client.api.data["connection_id"], sequence=1,
+                event_type="chore.upserted", epoch=1,
+            )
+            client.outbox = {"wire": {"eventId": event_id}}
+            client.workflow = {"parent": "task-a", "phase": "complete"}
+            client._result = asyncio.get_running_loop().create_future()
+            frame = {
+                "type": "PACK_EVENT", "protocolVersion": 3, "syncGeneration": 3,
+                "packId": "pack-a", "dataEpoch": 1, "serverSequence": 2,
+                "eventId": event_id, "eventType": "chore.upserted",
+                "actorUserId": "user-a", "actorDeviceId": client.api.data["connection_id"],
+                "deviceSequence": 1, "keyEpoch": 1, "entityType": kind,
+                "entityId": wire_id, "entityVersion": 2, "operation": operation,
+                "serverTimestamp": "2026-11-01T23:00:00Z",
+                "encryptedPayload": encode64(encoded.encode()), "signature": encoded.split(".")[4],
+                "senderSigningPublicKey": client.api.identity.public["signingPublicKey"],
+            }
+            await client._frame(json.dumps(frame))
+            with pytest.raises(PermissionDenied):
+                await client._result
+            assert client.state.chores["task-a"] == original
+            assert client.state.last_sequence == 2 and client.state.revisions[kind + ":" + wire_id] == 2
+            assert client.state.own_applied_events == []
+            assert client.state.own_rejected_events == [event_id]
+            assert client.outbox is None and client.workflow is None
+            assert client.metrics["mutations_verified"] == 0 and client.metrics["mutations_rejected"] == 1
+            assert saved[-1]["outbox"] is None and saved[-1]["workflow"] is None
+
+            # A crash after a durable quarantine but before outbox settlement is also definitive.
+            cache = deepcopy(saved[-1])
+            cache["outbox"] = {"wire": {"eventId": event_id}}
+            cache["workflow"] = {"parent": "task-a", "phase": "complete"}
+            restarted = restarted_client(client, cache)
+            restarted._result = asyncio.get_running_loop().create_future()
+            await restarted._settle_receipt()
+            with pytest.raises(PermissionDenied):
+                await restarted._result
+            assert restarted.outbox is None and restarted.workflow is None
+            assert restarted.metrics["mutations_verified"] == 0
+            assert restarted.metrics["mutations_rejected"] == 1
         finally:
             await session.close()
 

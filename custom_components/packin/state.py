@@ -117,6 +117,7 @@ class PackState:
     last_sequence: int = 0
     device_sequence: int = 0
     own_applied_events: list[str] = field(default_factory=list, repr=False)
+    own_rejected_events: list[str] = field(default_factory=list, repr=False)
     chores: dict[str, dict[str, Any]] = field(default_factory=dict)
     groceries: dict[str, dict[str, Any]] = field(default_factory=dict)
     shopping_lists: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -139,6 +140,7 @@ class PackState:
                     "last_sequence",
                     "device_sequence",
                     "own_applied_events",
+                    "own_rejected_events",
                     "chores",
                     "groceries",
                     "shopping_lists",

@@ -57,6 +57,10 @@ class PackClient:
         state.role = data["role"]
         self.log = EventLog(state, self.keys)
         self.log.device_id = data["connection_id"]
+        # Older nonempty caches already have an ordered, verified replay cursor.
+        # A new/empty projection must bootstrap from the complete event ledger:
+        # RESUME only includes the current data epoch on the server.
+        self._needs_snapshot = not bool(cache.get("bootstrap_verified", state.last_sequence > 0))
         self.outbox = deepcopy(cache.get("outbox"))
         self.workflow = deepcopy(cache.get("workflow"))
         self.device_sequence = max(
@@ -119,6 +123,7 @@ class PackClient:
                 "outbox": deepcopy(self.outbox),
                 "workflow": deepcopy(self.workflow),
                 "device_sequence": self.device_sequence,
+                "bootstrap_verified": not self._needs_snapshot,
             }
             await self.persist(value)
 
@@ -149,6 +154,7 @@ class PackClient:
         if clear:
             self.outbox = self.workflow = None
             self.log.state = PackState(self.state.pack_id, self.state.user_id, "read_only", self.state.data_epoch)
+            self._needs_snapshot = True
         await self._save()
         self._notify()
 
@@ -160,6 +166,7 @@ class PackClient:
         self.locations.clear()
         self.outbox = self.workflow = None
         self.log.state = PackState(self.state.pack_id, self.state.user_id, "read_only", self.state.data_epoch)
+        self._needs_snapshot = True
         self.api.data["pack_keys"] = {}
         self.api.data["members"] = []
         self.api.data["reauth_reason"] = code
@@ -193,6 +200,11 @@ class PackClient:
             raise ActionPending("Pack-In is reconnecting; the action is saved")
         await self._ws.send_json(value, dumps=lambda obj: json.dumps(obj, ensure_ascii=False, separators=(",", ":")))
 
+    def _sync_request(self) -> dict[str, Any]:
+        if self._needs_snapshot:
+            return {"type": "SNAPSHOT"}
+        return {"type": "RESUME", "afterSequence": self.state.last_sequence}
+
     async def _send_outbox(self) -> None:
         if self.outbox and self.log.synced and not self._waiting_key and self._sent_connection != self._connection_id:
             self._sent_connection = self._connection_id
@@ -203,6 +215,14 @@ class PackClient:
         if not self.outbox:
             return
         event_id = self.outbox["wire"]["eventId"]
+        if event_id in self.state.own_rejected_events:
+            self.outbox = self.workflow = None
+            self._sent_connection = None
+            self.metrics["mutations_rejected"] += 1
+            await self._save()
+            if self._result and not self._result.done():
+                self._result.set_exception(PermissionDenied("Pack-In rejected this action's permissions"))
+            return
         if event_id not in self.state.own_applied_events:
             return
         self.outbox = None
@@ -240,6 +260,7 @@ class PackClient:
                 self.log.state = PackState(
                     self.state.pack_id, self.state.user_id, self.api.data["role"], int(frame["dataEpoch"])
                 )
+                self._needs_snapshot = True
                 self.api.data["data_epoch"] = int(frame["dataEpoch"])
                 await self.api._save()
                 await self._save()
@@ -248,7 +269,7 @@ class PackClient:
                 raise IntegrityError("Missing device sequence")
             self.device_sequence = max(self.device_sequence, next_sequence - 1)
             await self._send(
-                {"type": "RESUME", "afterSequence": self.state.last_sequence, "capabilities": CAPABILITIES}
+                {**self._sync_request(), "capabilities": CAPABILITIES}
             )
             return
         if (
@@ -303,7 +324,7 @@ class PackClient:
             self._waiting_key = False
             self._waiting_epoch = None
             self.log.reset_connection()
-            await self._send({"type": "RESUME", "afterSequence": self.state.last_sequence})
+            await self._send(self._sync_request())
             return
         if kind == "KEY_EPOCH_CHANGED":
             epoch = frame.get("keyEpoch") or frame.get("currentKeyEpoch")
@@ -316,8 +337,12 @@ class PackClient:
             return
         if self._waiting_key:
             return
+        if kind in {"SNAPSHOT_REQUIRED", "SNAPSHOT_BEGIN"}:
+            self._needs_snapshot = True
         before = self.state.last_sequence
         responses = await self.log.feed(raw)
+        if kind == "SNAPSHOT_COMPLETE":
+            self._needs_snapshot = False
         for response in responses:
             await self._send(response)
         if self.state.last_sequence != before or kind == "SNAPSHOT_COMPLETE":
@@ -458,6 +483,7 @@ class PackClient:
         self.locations.clear()
         self.log.state = PackState(self.state.pack_id, self.state.user_id, self.api.data["role"], result["dataEpoch"])
         self.log.reset_connection()
+        self._needs_snapshot = True
         await self._save()
         self.metrics["epoch_recoveries"] += 1
         if self._result and not self._result.done():

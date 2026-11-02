@@ -93,8 +93,20 @@ class EventLog:
                 entity_version=self._integer(frame.get("entityVersion"), 1),
             )
         except (ProjectionError, ValueError, KeyError, TypeError):
-            # A valid signature cannot authorize completing another member's task.
-            # Like Android, quarantine that semantic mutation and retain the cursor.
+            # Keep the accepted transport head, like Android, while quarantining
+            # forbidden domain fields. This runs only after successful decryption
+            # and signature verification, never for a cryptographic failure.
+            entity_type, entity_id = frame.get("entityType"), frame.get("entityId")
+            if (
+                isinstance(entity_type, str) and entity_type and entity_type != "legacy_envelope"
+                and isinstance(entity_id, str) and entity_id
+            ):
+                key = entity_type + ":" + entity_id
+                target.revisions[key] = max(
+                    target.revisions.get(key, 0), self._integer(frame.get("entityVersion"), 1)
+                )
+            if frame.get("actorDeviceId") == getattr(self, "device_id", None) and isinstance(frame.get("eventId"), str):
+                target.own_rejected_events = [*target.own_rejected_events[-199:], frame["eventId"]]
             self.metrics["domain_mutations_rejected"] += 1
             return
         if frame.get("actorDeviceId") == getattr(self, "device_id", None) and isinstance(frame.get("eventId"), str):

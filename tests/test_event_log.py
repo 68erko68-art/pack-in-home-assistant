@@ -6,6 +6,9 @@ import hashlib
 import json
 
 import pytest
+from cryptography.exceptions import InvalidSignature, InvalidTag
+
+from packin_pure.crypto import CryptoError, DeviceIdentity, decode64, encode64
 
 from packin_pure.event_log import EventLog, IntegrityError
 from packin_pure.protocol import descriptor
@@ -212,5 +215,105 @@ def test_own_application_receipt_is_durable_and_not_added_for_forbidden_completi
         assert events.state.own_applied_events == ["event-1"]
         restored = PackState.restore(events.state.export(), "pack1", "member")
         assert restored.own_applied_events == ["event-1"]
+
+    asyncio.run(run())
+
+
+def encrypted_frame(identity, sequence, payload, *, actor_device="other-device", version=None):
+    value = frame(
+        sequence, identifier=payload["id"], actorDeviceId=actor_device,
+        entityVersion=sequence if version is None else version,
+    )
+    kind, wire, operation = descriptor("chore.upserted", payload)
+    encrypted = identity.encrypt_event(
+        encode(payload).encode(), b"k" * 32, pack="pack1", event=value["eventId"],
+        device=actor_device, sequence=sequence, event_type="chore.upserted", epoch=1,
+    )
+    value.update(
+        entityType=kind, entityId=wire, operation=operation, keyEpoch=1,
+        encryptedPayload=encode64(encrypted.encode()), signature=encrypted.split(".")[4],
+        senderSigningPublicKey=identity.public["signingPublicKey"],
+    )
+    value.pop("testPayload")
+    return value
+
+
+def forbidden_pair(identity, *, own=False):
+    original = frame(1, identifier="shared")["testPayload"]
+    original["historyJson"] = '[{"kind":"packin_task_assignees_v1","userIds":["other"]}]'
+    candidate = {
+        **original, "completedAt": 1793570400000, "completedByUserId": "member",
+    }
+    return (
+        encrypted_frame(identity, 1, original),
+        encrypted_frame(identity, 2, candidate, actor_device="own-device" if own else "other-device"),
+    )
+
+
+def test_real_signed_forbidden_completion_advances_revision_without_domain_change_then_allows_edit():
+    async def run():
+        identity = DeviceIdentity.generate()
+        events = EventLog(PackState("pack1", "member", "member", data_epoch=2), lambda: {1: b"k" * 32})
+        original, forbidden = forbidden_pair(identity)
+        await events.feed(encode(original))
+        prior = deepcopy(events.state.chores["shared"])
+        await events.feed(encode(forbidden))
+        key = forbidden["entityType"] + ":" + forbidden["entityId"]
+        assert events.state.last_sequence == 2 and events.state.revisions[key] == 2
+        assert events.state.chores["shared"] == prior
+        assert events.metrics["domain_mutations_rejected"] == 1
+
+        corrected = {**prior, "title": "A permitted title change"}
+        await events.feed(encode(encrypted_frame(identity, 3, corrected)))
+        assert events.state.last_sequence == 3 and events.state.revisions[key] == 3
+        assert events.state.chores["shared"]["title"] == "A permitted title change"
+        assert events.state.chores["shared"].get("completedAt") is None
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("field", ["ciphertext", "signature"])
+def test_cryptographically_invalid_completion_never_advances_revision_cursor_or_receipts(field):
+    async def run():
+        identity = DeviceIdentity.generate()
+        events = EventLog(PackState("pack1", "member", "member", data_epoch=2), lambda: {1: b"k" * 32})
+        events.device_id = "own-device"
+        original, invalid = forbidden_pair(identity, own=True)
+        await events.feed(encode(original))
+        parts = decode64(invalid["encryptedPayload"]).decode().split(".")
+        index = 3 if field == "ciphertext" else 4
+        damaged = bytearray(decode64(parts[index]))
+        damaged[-1] ^= 1
+        parts[index] = encode64(bytes(damaged))
+        invalid["encryptedPayload"] = encode64(".".join(parts).encode())
+        invalid["signature"] = parts[4]
+        before = events.state.export()
+        with pytest.raises((CryptoError, InvalidSignature, InvalidTag)):
+            await events.feed(encode(invalid))
+        assert events.state.export() == before
+        assert events.metrics["domain_mutations_rejected"] == 0
+
+    asyncio.run(run())
+
+
+def test_signed_forbidden_snapshot_row_preserves_domain_but_persists_revision_and_rejected_own_receipt():
+    async def run():
+        identity = DeviceIdentity.generate()
+        events = EventLog(PackState("pack1", "member", "member", data_epoch=2), lambda: {1: b"k" * 32})
+        events.device_id = "own-device"
+        rows = [{**value, "type": "SNAPSHOT_ROW"} for value in forbidden_pair(identity, own=True)]
+        begin, complete = boundaries(rows)
+        await events.feed(encode(begin))
+        for row in rows:
+            await events.feed(encode(row))
+        assert not events.state.chores
+        await events.feed(encode(complete))
+        key = rows[1]["entityType"] + ":" + rows[1]["entityId"]
+        assert events.state.last_sequence == 2 and events.state.revisions[key] == 2
+        assert events.state.chores["shared"].get("completedAt") is None
+        assert events.state.own_applied_events == []
+        assert events.state.own_rejected_events == ["event-2"]
+        restored = PackState.restore(events.state.export(), "pack1", "member")
+        assert restored.own_rejected_events == ["event-2"] and restored.revisions[key] == 2
 
     asyncio.run(run())
