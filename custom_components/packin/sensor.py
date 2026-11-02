@@ -64,6 +64,7 @@ class PackStatus(PackEntity, SensorEntity):
                 "members": [
                     {
                         "name": m.get("displayName") or "Pack member",
+                        "member_id": m["userId"],
                         "role": m.get("role"),
                         "location_sharing": bool(m.get("locationConsent")),
                     }

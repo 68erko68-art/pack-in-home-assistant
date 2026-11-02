@@ -403,3 +403,94 @@ def test_snapshot_never_commits_a_currently_private_list():
     )
     p.finish_snapshot_visibility()
     assert p.groceries == {} and p.shopping_lists == {}
+
+
+def test_calendar_compound_changes_cannot_bypass_wire_identity_or_revision_checks():
+    from packin_pure.protocol import descriptor
+
+    projection = state.PackState("pack", "owner", "owner")
+    split = {"original": {"id": "series", "name": "School"}, "future": {"id": "future", "name": "School"}}
+    kind, identity, _ = descriptor("calendar.event.series.split", split)
+    with pytest.raises(state.ProjectionError):
+        projection.apply(
+            "calendar.event.series.split",
+            split,
+            "owner",
+            NOW,
+            entity_type=kind,
+            entity_id="wrong-identity",
+            entity_version=1,
+        )
+    assert not projection.calendar
+    projection.apply(
+        "calendar.event.series.split", split, "owner", NOW, entity_type=kind, entity_id=identity, entity_version=1
+    )
+    assert set(projection.calendar) == {"series", "future"}
+    with pytest.raises(state.ProjectionError):
+        projection.apply(
+            "calendar.event.series.split",
+            split,
+            "owner",
+            NOW + 1,
+            entity_type=kind,
+            entity_id=identity,
+            entity_version=1,
+        )
+    override = {"seriesEventId": "series", "occurrenceDate": "2026-11-02", "status": "CANCELLED"}
+    kind, identity, _ = descriptor("calendar.event.override.upserted", override)
+    with pytest.raises(state.ProjectionError):
+        projection.apply(
+            "calendar.event.override.upserted",
+            override,
+            "owner",
+            NOW,
+            entity_type=kind,
+            entity_id="wrong-identity",
+            entity_version=1,
+        )
+    assert not projection.calendar_overrides
+    projection.apply(
+        "calendar.event.override.upserted",
+        override,
+        "owner",
+        NOW,
+        entity_type=kind,
+        entity_id=identity,
+        entity_version=1,
+    )
+    assert projection.revisions[kind + ":" + identity] == 1
+
+
+def test_received_grocery_purchase_respects_assignment_and_authenticated_buyer():
+    projection = state.PackState("pack", "owner", "owner")
+    item = {
+        "id": "milk",
+        "name": "Milk",
+        "checked": False,
+        "claimedByUserId": "member",
+        "purchasedAt": None,
+        "purchasedByUserId": None,
+        "historyJson": "[]",
+    }
+    projection.groceries["milk"] = item
+    with pytest.raises(state.ProjectionError):
+        projection.apply(
+            "grocery.item.upserted",
+            {**item, "checked": True, "purchasedAt": NOW, "purchasedByUserId": "owner"},
+            "owner",
+            NOW,
+        )
+    with pytest.raises(state.ProjectionError):
+        projection.apply(
+            "grocery.item.upserted",
+            {**item, "checked": True, "purchasedAt": NOW, "purchasedByUserId": "owner"},
+            "member",
+            NOW,
+        )
+    projection.apply(
+        "grocery.item.upserted",
+        {**item, "checked": True, "purchasedAt": NOW, "purchasedByUserId": "member"},
+        "member",
+        NOW,
+    )
+    assert projection.groceries["milk"]["purchasedByUserId"] == "member"

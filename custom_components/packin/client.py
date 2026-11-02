@@ -51,7 +51,7 @@ class PackClient:
             if cache.get("state")
             else (PackState(data["pack_id"], data["user_id"], data["role"], data["data_epoch"]))
         )
-        if state.data_epoch != data["data_epoch"]:
+        if state.data_epoch != data["data_epoch"] or data.get("reauth_reason"):
             state = PackState(data["pack_id"], data["user_id"], data["role"], data["data_epoch"])
             cache = {}
         state.role = data["role"]
@@ -82,12 +82,13 @@ class PackClient:
         self._location_lock = asyncio.Lock()
         self._wake_locations = asyncio.Event()
         self._last_location_attempt = 0.0
+        self._last_metadata_attempt = 0.0
         self._result: asyncio.Future | None = None
         self._sent_connection: str | None = None
         self._connection_id = ""
         self._key_requested: set[int] = set()
         self._waiting_key = False
-        self._blocked = False
+        self._blocked = bool(data.get("reauth_reason"))
         self._workflow_task: asyncio.Task | None = None
 
     @property
@@ -120,7 +121,7 @@ class PackClient:
             await self.persist(value)
 
     def start(self) -> None:
-        if self._tasks:
+        if self._tasks or self._blocked:
             return
         self._tasks = [
             self.create_task(self._connect_loop(), "Pack-In synchronization"),
@@ -158,10 +159,14 @@ class PackClient:
         self.outbox = self.workflow = None
         self.log.state = PackState(self.state.pack_id, self.state.user_id, "read_only", self.state.data_epoch)
         self.api.data["pack_keys"] = {}
+        self.api.data["members"] = []
+        self.api.data["reauth_reason"] = code
         await self.api._save()
         await self._save()
         if self._result and not self._result.done():
             self._result.set_exception(PermissionDenied("Reconnect Pack-In in Devices & services"))
+        if self._ws is not None:
+            await self._ws.close()
         self.auth_failed(code)
         self._notify()
 
@@ -190,6 +195,8 @@ class PackClient:
             self._result.set_result(None)
 
     async def _frame(self, raw: str) -> None:
+        if self._blocked:
+            return
         try:
             frame = json.loads(raw)
         except ValueError:
@@ -249,9 +256,16 @@ class PackClient:
             return
         if kind == "HOME_ASSISTANT_LOCATION_CONSENT":
             user_id = frame.get("userId")
+            if (
+                frame.get("enabled") is True
+                and not any(m.get("userId") == user_id for m in self.api.data.get("members", []))
+                and time.monotonic() - self._last_metadata_attempt >= 60
+            ):
+                self._last_metadata_attempt = time.monotonic()
+                await self.api.metadata()
             for member in self.api.data.get("members", []):
                 if member.get("userId") == user_id:
-                    member["locationConsent"] = bool(frame.get("enabled"))
+                    member["locationConsent"] = frame.get("enabled") is True
             self.locations.pop(user_id, None)
             self._wake_locations.set()
             self._notify()
@@ -348,6 +362,11 @@ class PackClient:
             except PackInApiError as exc:
                 self.error = exc.code
                 delay = max(delay, exc.retry_after)
+                if exc.status == 409:
+                    # Refresh once only when the server proves a new data epoch.
+                    # Unsupported Packs/protocols must not become retry storms.
+                    if await self._recover_handshake():
+                        continue
                 if exc.auth_failed:
                     await self._deny(exc.code)
                     break
@@ -378,6 +397,44 @@ class PackClient:
             failures = 0 if time.monotonic() - started > 300 else failures + 1
             self.metrics["reconnect_waits"] += 1
             await asyncio.sleep(delay * random.uniform(1.0, 1.2))
+
+    async def _recover_handshake(self) -> bool:
+        old_epoch = self.state.data_epoch
+        try:
+            result = await self.api.metadata()
+        except PackInApiError as exc:
+            if exc.auth_failed:
+                await self._deny(exc.code)
+                return False
+            if exc.status == 409:
+                self._blocked = True
+                self.status = "attention_required"
+                self.error = exc.code
+                self._notify()
+            # A failed network metadata check uses the ordinary bounded backoff.
+            return False
+        if (
+            result.get("authorityMode") != "v3"
+            or result.get("protocolVersion") != PROTOCOL_VERSION
+            or result.get("syncGeneration") != SYNC_GENERATION
+            or type(result.get("dataEpoch")) is not int
+            or result["dataEpoch"] <= old_epoch
+        ):
+            self._blocked = True
+            self.status = "attention_required"
+            self.error = "synchronization_upgrade_required"
+            self._notify()
+            return False
+        self.outbox = self.workflow = None
+        self.locations.clear()
+        self.log.state = PackState(self.state.pack_id, self.state.user_id, self.api.data["role"], result["dataEpoch"])
+        self.log.reset_connection()
+        await self._save()
+        self.metrics["epoch_recoveries"] += 1
+        if self._result and not self._result.done():
+            self._result.set_exception(Conflict("Pack-In data was reset; the old action was cancelled"))
+        self._notify()
+        return True
 
     async def _renew_loop(self) -> None:
         while not self._stopping and not self._blocked:

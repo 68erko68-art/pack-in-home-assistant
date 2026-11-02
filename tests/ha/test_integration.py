@@ -29,6 +29,7 @@ def config():
         "role": "member",
         "scopes": SCOPES,
         "data_epoch": 1,
+        "authority_mode": "v3",
         "key_epoch": 1,
         "pack_keys": {"1": encode64(b"k" * 32)},
         "access_token": encode64(secrets.token_bytes(32)),
@@ -174,8 +175,10 @@ async def test_options_interval_zero_and_ten_minutes(hass):
     entry = await setup_entry(hass)
     result = await hass.config_entries.options.async_init(entry.entry_id)
     assert result["type"] == FlowResultType.FORM
-    with patch("custom_components.packin.async_options_updated", new=AsyncMock()):
+    with patch.object(hass.config_entries, "async_reload", new_callable=AsyncMock) as reload_entry:
         result = await hass.config_entries.options.async_configure(result["flow_id"], {"location_interval": 0})
+        await hass.async_block_till_done()
+        reload_entry.assert_awaited_once_with(entry.entry_id)
     assert result["type"] == FlowResultType.CREATE_ENTRY
     assert entry.options["location_interval"] == 0
     await hass.config_entries.async_unload(entry.entry_id)

@@ -13,13 +13,14 @@
       },
       "pair": {
         "title": "Approve on your phone",
-        "description": "In Pack-In, open Settings \u2192 Connected homes \u2192 Connect a home. Enter **{code}**, select a Pack and review its permissions. Then select Submit here. This code expires after 5 minutes. Connection fingerprint: {fingerprint}."
+        "description": "In Pack-In, open Settings → Connected homes → Connect a home. Enter **{code}**, select a Pack and review its permissions. Then select Submit here. This code expires after 5 minutes. Connection fingerprint: {fingerprint}."
       }
     },
     "error": {
       "unavailable": "Pack-In could not be reached. Check your connection and try again.",
       "rate_limited": "Please wait before trying again.",
-      "approval_pending": "Approval is still pending. Approve this home in Pack-In first."
+      "approval_pending": "Approval is still pending. Approve this home in Pack-In first.",
+      "waiting_for_keys": "The Pack key changed during setup. In Pack-In, open Connected homes and share pending keys, then submit here."
     },
     "abort": {
       "pairing_expired": "The code expired. Start setup again.",

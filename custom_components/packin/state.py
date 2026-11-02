@@ -178,6 +178,12 @@ class PackState:
             return
         if payload.get("packId", self.pack_id) != self.pack_id:
             raise ProjectionError("Item belongs to another Pack")
+        if entity_type and entity_type != "legacy_envelope":
+            expected_type, expected_id, _ = descriptor(event_type, payload)
+            if entity_type != expected_type or entity_id != expected_id:
+                raise ProjectionError("Item wire identity does not match the signed payload")
+            if entity_version <= self.revisions.get(entity_type + ":" + entity_id, 0):
+                raise ProjectionError("Item revision did not advance")
         if kind == "calendar.event" and "original" in payload and "future" in payload:
             original, future = payload["original"], payload["future"]
             if (
@@ -191,6 +197,8 @@ class PackState:
                 raise ProjectionError("Calendar split belongs to another Pack")
             self.apply("calendar.event.upserted", original, actor, accepted_ms)
             self.apply("calendar.event.upserted", future, actor, accepted_ms)
+            if entity_type and entity_type != "legacy_envelope":
+                self.revisions[entity_type + ":" + entity_id] = entity_version
             return
         if kind == "calendar.event" and "seriesEventId" in payload:
             from datetime import date
@@ -214,6 +222,8 @@ class PackState:
                         raise ProjectionError("Invalid calendar replacement")
                     self.apply("calendar.event.upserted", replacement, actor, accepted_ms)
                 self.calendar_overrides[key] = deepcopy(payload)
+            if entity_type and entity_type != "legacy_envelope":
+                self.revisions[entity_type + ":" + entity_id] = entity_version
             return
         identifier = payload.get("id")
         if not isinstance(identifier, str) or not identifier or len(identifier) > 256:
@@ -221,10 +231,6 @@ class PackState:
         if payload.get("packId", self.pack_id) != self.pack_id:
             raise ProjectionError("Item belongs to another Pack")
         collection = self.collection(kind)
-        if entity_type and entity_type != "legacy_envelope":
-            expected_type, expected_id, _ = descriptor(event_type, payload)
-            if entity_type != expected_type or entity_id != expected_id:
-                raise ProjectionError("Item wire identity does not match the signed payload")
         current = collection.get(identifier)
         tombstone_id = kind + ":" + identifier
         is_removed = event_type.endswith(".removed")
@@ -271,6 +277,29 @@ class PackState:
                     }
                     return
             if kind == "grocery.item":
+                if accepted_ms >= 1793511601000:
+                    purchase_changed = (
+                        bool(
+                            candidate.get("checked")
+                            or candidate.get("purchasedAt")
+                            or candidate.get("purchasedByUserId")
+                        )
+                        if current is None
+                        else any(
+                            current.get(field) != candidate.get(field)
+                            for field in ("checked", "purchasedAt", "purchasedByUserId")
+                        )
+                    )
+                    if purchase_changed:
+                        claimant = (current or candidate).get("claimedByUserId")
+                        if claimant and claimant != actor:
+                            raise ProjectionError("Grocery purchase is assigned to another member")
+                        if current and current.get("claimedByUserId") != candidate.get("claimedByUserId"):
+                            raise ProjectionError("Assign and purchase the item as separate actions")
+                        if candidate.get("checked") and candidate.get("purchasedByUserId") != actor:
+                            raise ProjectionError("Grocery purchaser does not match the sender")
+                        if not candidate.get("checked") and candidate.get("purchasedByUserId") is not None:
+                            raise ProjectionError("Unpurchased item has a purchaser")
                 list_id = candidate.get("shoppingListId")
                 parent = self.shopping_lists.get(list_id) if list_id else None
                 if (

@@ -67,6 +67,9 @@ def descriptor(event_type: str, payload: dict[str, Any]) -> tuple[str, str, str]
             raise UnsupportedSchema("Unsupported Pack entity category")
         kind = TYPES[category]
         logical = payload.get("id")
+        if not logical and "original" in payload and "future" in payload:
+            # Canonical Kotlin fallback for compound calendar mutations.
+            logical = f"{event_type}:{payload.get('seriesEventId', '')}:{payload.get('occurrenceDate', '')}:{payload.get('kind', '')}:singleton"
     if not isinstance(logical, str) or not logical:
         raise UnsupportedSchema("A stable item identity is required")
     operation = (

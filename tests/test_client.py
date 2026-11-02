@@ -8,7 +8,7 @@ import json
 import aiohttp
 import pytest
 
-from packin_pure.api import PackInApi, SCOPES
+from packin_pure.api import PackInApi, PackInApiError, SCOPES
 from packin_pure.client import PackClient, ActionPending, Conflict
 from packin_pure.crypto import DeviceIdentity, encode64
 from packin_pure.state import PermissionDenied, occurrence
@@ -296,6 +296,126 @@ def test_expired_authorization_never_reports_cached_data_available():
             assert client.available is False
             with pytest.raises(ActionPending):
                 await client.add_task("Expired permission")
+        finally:
+            await session.close()
+
+    run(scenario())
+
+
+def test_superseded_connection_cannot_restart_from_a_copied_cache():
+    async def scenario():
+        session, client, saved, _, _ = await client_fixture()
+        try:
+            client.state.chores["task-a"] = task()
+            await client._deny("duplicate_connection")
+            assert client.api.data["reauth_reason"] == "duplicate_connection"
+            assert client.api.data["members"] == []
+            with pytest.raises(PackInApiError):
+                await client.api.ensure_session()
+            restarted = PackClient(
+                client.api,
+                saved[-1],
+                client.persist,
+                client.changed,
+                client.auth_failed,
+                lambda coro, name: asyncio.create_task(coro, name=name),
+            )
+            restarted.start()
+            assert restarted._blocked and not restarted._tasks
+            assert not restarted.state.chores and not restarted.available
+        finally:
+            await session.close()
+
+    run(scenario())
+
+
+def test_handshake_epoch_recovery_cancels_old_actions_and_never_loops_on_unchanged_epoch():
+    async def scenario():
+        session, client, saved, _, _ = await client_fixture()
+        calls = []
+        try:
+            client.state.chores["task-a"] = task()
+            client.outbox = {"wire": {"eventId": "old-epoch-action"}}
+
+            async def metadata():
+                calls.append(True)
+                client.api.data["data_epoch"] = 2
+                return {"authorityMode": "v3", "protocolVersion": 3, "syncGeneration": 3, "dataEpoch": 2}
+
+            client.api.metadata = metadata
+            assert await client._recover_handshake()
+            assert client.state.data_epoch == 2 and not client.state.chores
+            assert client.outbox is None and saved[-1]["outbox"] is None
+            assert not await client._recover_handshake()
+            assert client._blocked and client.status == "attention_required"
+            assert len(calls) == 2
+        finally:
+            await session.close()
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("status,blocked", [(0, False), (409, True)])
+def test_failed_metadata_recovery_uses_backoff_instead_of_immediate_retry(status, blocked):
+    async def scenario():
+        session, client, _, _, _ = await client_fixture()
+
+        async def metadata():
+            raise PackInApiError(
+                "network_unavailable" if not status else "home_assistant_sync_upgrade_required", status
+            )
+
+        client.api.metadata = metadata
+        try:
+            assert not await client._recover_handshake()
+            assert client._blocked is blocked
+        finally:
+            await session.close()
+
+    run(scenario())
+
+
+def test_legacy_handshake_stops_after_one_metadata_check():
+    async def scenario():
+        session, client, _, _, _ = await client_fixture()
+        calls = []
+
+        async def websocket():
+            calls.append("handshake")
+            raise PackInApiError("home_assistant_sync_upgrade_required", 409)
+
+        async def metadata():
+            calls.append("metadata")
+            return {"authorityMode": "legacy", "protocolVersion": 3, "syncGeneration": 3, "dataEpoch": 1}
+
+        client.api.websocket = websocket
+        client.api.metadata = metadata
+        try:
+            await asyncio.wait_for(client._connect_loop(), 2)
+            assert calls == ["handshake", "metadata"]
+            assert client._blocked and not client.available
+        finally:
+            await session.close()
+
+    run(scenario())
+
+
+def test_new_member_consent_refreshes_roster_once_without_member_polling():
+    async def scenario():
+        session, client, _, _, _ = await client_fixture()
+        calls = []
+
+        async def metadata():
+            calls.append(True)
+            client.api.data["members"].append({"userId": "new-member", "locationConsent": True})
+
+        client.api.metadata = metadata
+        try:
+            frame = json.dumps({"type": "HOME_ASSISTANT_LOCATION_CONSENT", "userId": "new-member", "enabled": True})
+            await client._frame(frame)
+            await client._frame(frame)
+            assert calls == [True]
+            assert any(m["userId"] == "new-member" for m in client.api.data["members"])
         finally:
             await session.close()
 

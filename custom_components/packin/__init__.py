@@ -9,12 +9,12 @@ import probatio
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall
-from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady, HomeAssistantError
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryError, ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.aiohttp_client import async_get_clientsession, async_create_clientsession
 from homeassistant.helpers.storage import Store
 
-from .api import PackInApi, PackInApiError
+from .api import PackInApi, PackInApiError, deny_redirect
 from .client import PackClient, ActionPending, Conflict
 from .const import DOMAIN, PLATFORMS, CONF_LOCATION_INTERVAL, DEFAULT_LOCATION_INTERVAL
 from .coordinator import PackCoordinator
@@ -84,12 +84,17 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     store = Store(hass, 1, DOMAIN + "." + entry.entry_id, private=True)
+    if entry.data.get("reauth_reason"):
+        await store.async_remove()
+        raise ConfigEntryAuthFailed("Reconnect Pack-In in Devices & services")
     identity = await hass.async_add_executor_job(DeviceIdentity.restore, dict(entry.data["identity"]))
 
     async def checkpoint(data: dict) -> None:
         hass.config_entries.async_update_entry(entry, data=data)
 
-    api = PackInApi(async_get_clientsession(hass), identity, dict(entry.data), checkpoint)
+    api = PackInApi(
+        async_create_clientsession(hass, middlewares=(deny_redirect,)), identity, dict(entry.data), checkpoint
+    )
     try:
         await api.metadata()  # One membership/entitlement check on setup, shared by every entity.
     except PackInApiError as exc:
@@ -97,9 +102,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             await store.async_remove()
             clean = dict(entry.data)
             clean["pack_keys"] = {}
+            clean["members"] = []
+            clean["reauth_reason"] = exc.code
             hass.config_entries.async_update_entry(entry, data=clean)
             raise ConfigEntryAuthFailed("Reconnect Pack-In to renew permission") from None
+        if exc.code == "home_assistant_sync_upgrade_required":
+            raise ConfigEntryError("This Pack needs a supported synchronization upgrade in Pack-In") from None
         raise ConfigEntryNotReady("Pack-In is temporarily unavailable") from None
+
+    if api.data.get("authority_mode") != "v3":
+        raise ConfigEntryError("This Pack needs a supported synchronization upgrade in Pack-In")
 
     encrypted = await store.async_load()
     cache = {}

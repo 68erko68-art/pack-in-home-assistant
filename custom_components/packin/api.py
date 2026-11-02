@@ -22,6 +22,7 @@ from .protocol import PROTOCOL_VERSION, SYNC_GENERATION
 API_ORIGIN = "https://pack-in-beta-api.68erko68.workers.dev"
 PREFIX = "/api/ha/v1"
 MAX_RESPONSE = 1_000_000
+WS_HEARTBEAT = 120
 SCOPES = [
     "tasks:read",
     "tasks:write",
@@ -47,12 +48,22 @@ class PackInApiError(Exception):
         return self.status in (401, 403)
 
 
+async def deny_redirect(request: aiohttp.ClientRequest, handler: aiohttp.ClientHandlerType) -> aiohttp.ClientResponse:
+    """Reject a redirect before aiohttp can forward a signed WebSocket request."""
+    response = await handler(request)
+    if 300 <= response.status < 400:
+        response.close()
+        raise PackInApiError("unexpected_redirect", response.status)
+    return response
+
+
 @dataclass(repr=False)
 class Pairing:
     identity: DeviceIdentity = field(repr=False)
     request: dict[str, Any] = field(repr=False)
     expires_at: int = 0
     claim: dict[str, Any] | None = field(default=None, repr=False)
+    requested_epoch: int | None = None
 
     @property
     def user_code(self) -> str:
@@ -234,6 +245,7 @@ class PackInApi:
             "accessExpiresAt": "access_expires_at_ms",
             "refreshExpiresAt": "refresh_expires_at_ms",
             "members": "members",
+            "authorityMode": "authority_mode",
         }
         for remote, local in mapping.items():
             if remote in result:
@@ -245,6 +257,8 @@ class PackInApi:
         await self._save()
 
     async def ensure_session(self, *, force: bool = False) -> None:
+        if self.data.get("reauth_reason"):
+            raise PackInApiError("connection_requires_reauth", 401)
         async with self._renew_lock:
             if (
                 not force
@@ -320,17 +334,22 @@ class PackInApi:
         self.metrics["websocket_handshakes"] += 1
         self.metrics["http_requests"] += 1
         try:
-            return await self.session.ws_connect(
-                self.origin + path,
-                headers=headers,
-                heartbeat=None,
-                autoping=True,
-                max_msg_size=1_600_000,
-                timeout=aiohttp.ClientWSTimeout(ws_close=10),
+            return await asyncio.wait_for(
+                self.session.ws_connect(
+                    self.origin + path,
+                    headers=headers,
+                    heartbeat=WS_HEARTBEAT,
+                    autoping=True,
+                    max_msg_size=1_600_000,
+                    timeout=aiohttp.ClientWSTimeout(ws_close=10),
+                ),
+                timeout=20,
             )
         except aiohttp.WSServerHandshakeError as exc:
             raise PackInApiError(
-                "connection_denied" if exc.status in (401, 403) else "connection_unavailable",
+                exc.headers.get("x-packin-ha-error-code", "connection_unavailable")
+                if exc.headers
+                else "connection_unavailable",
                 exc.status,
                 self._retry_after(exc.headers.get("retry-after") if exc.headers else None),
             ) from None
@@ -379,9 +398,16 @@ class PackInApi:
             refresh_token=pairing.claim["refreshToken"],
             cache_key=encode64(secrets.token_bytes(32)),
             device_sequence=0,
+            reauth_reason=None,
+            pending_rotation=None,
         )
         await self._merge_metadata(result)
         current = self.data.get("key_epoch")
         if str(current) not in self.data.get("pack_keys", {}):
+            if type(current) is not int or current < 1:
+                raise PackInApiError("invalid_key_epoch")
+            if pairing.requested_epoch != current:
+                await self.request_key(current)
+                pairing.requested_epoch = current
             raise PackInApiError("current_pack_key_required")
         return dict(self.data)

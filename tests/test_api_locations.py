@@ -12,9 +12,23 @@ import aiohttp
 from aiohttp import web
 import pytest
 
-from packin_pure.api import PackInApi, PackInApiError, install_keys
+from packin_pure.api import PackInApi, PackInApiError, install_keys, deny_redirect
 from packin_pure.crypto import CryptoError, DeviceIdentity, decode64, encode64, wrap_context, verify
 from packin_pure.find_me import decode_locations
+
+
+@pytest.fixture(autouse=True)
+def loopback_transport_only(request):
+    # HA blocks sockets by default. Its official fixture opens the constructor;
+    # retain the destination guard so these transport tests can reach only loopback.
+    import importlib.util
+
+    if importlib.util.find_spec("pytest_homeassistant_custom_component") is not None:
+        request.getfixturevalue("socket_enabled")
+        import pytest_socket
+
+        pytest_socket.socket_allow_hosts(["127.0.0.1"])
+
 
 ID = "ha_" + "1234567890abcdef" * 2
 PATH = "/api/ha/v1/connections/" + ID
@@ -259,3 +273,60 @@ def test_newest_signed_observation_wins_without_fabricating_a_new_observation_ti
     ]
     result = decode_locations(rows, "synthetic-pack", {7: b"k" * 32}, {"member"}, now)
     assert result["member"].age_seconds(now) == 300
+
+
+def test_websocket_redirect_never_forwards_device_proof_to_another_endpoint():
+    async def run():
+        reached = []
+
+        async def trap(request):
+            reached.append(request.path)
+            return web.Response(status=400)
+
+        async with server(trap) as trap_origin:
+
+            async def redirect(request):
+                return web.Response(status=302, headers={"location": trap_origin + "/credential-trap"})
+
+            async with server(redirect) as origin, aiohttp.ClientSession(middlewares=(deny_redirect,)) as session:
+                api = PackInApi(session, DeviceIdentity.generate(), credentials(), _test_origin=origin)
+                with pytest.raises(PackInApiError) as error:
+                    await api.websocket()
+                assert error.value.code == "unexpected_redirect"
+                assert reached == []
+
+    asyncio.run(run())
+
+
+def test_websocket_control_ping_keeps_one_connection_without_application_polling(monkeypatch):
+    monkeypatch.setattr("packin_pure.api.WS_HEARTBEAT", 0.02)
+
+    async def run():
+        ping = asyncio.Event()
+        requests = []
+
+        async def handler(request):
+            requests.append(request.path)
+            ws = web.WebSocketResponse(autoping=False)
+            await ws.prepare(request)
+            async for message in ws:
+                if message.type == aiohttp.WSMsgType.PING:
+                    ping.set()
+                    await ws.pong(message.data)
+                else:
+                    raise AssertionError("No application heartbeat or polling is expected")
+            return ws
+
+        async with server(handler) as origin, aiohttp.ClientSession(middlewares=(deny_redirect,)) as session:
+            api = PackInApi(session, DeviceIdentity.generate(), credentials(), _test_origin=origin)
+            ws = await api.websocket()
+            receive = asyncio.create_task(ws.receive())
+            try:
+                await asyncio.wait_for(ping.wait(), 2)
+                assert len(requests) == 1 and api.metrics["http_requests"] == 1
+            finally:
+                receive.cancel()
+                await asyncio.gather(receive, return_exceptions=True)
+                await ws.close()
+
+    asyncio.run(run())

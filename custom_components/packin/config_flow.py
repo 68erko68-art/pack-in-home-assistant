@@ -92,7 +92,13 @@ class PackInFlow(ConfigFlow, domain=DOMAIN):
                             return self.async_abort(reason="already_configured")
                         return self.async_create_entry(title=data.get("pack_name", "Pack-In"), data=data)
                 except PackInApiError as exc:
-                    errors["base"] = "rate_limited" if exc.status == 429 else "unavailable"
+                    errors["base"] = (
+                        "rate_limited"
+                        if exc.status == 429
+                        else "waiting_for_keys"
+                        if exc.code == "current_pack_key_required"
+                        else "unavailable"
+                    )
         return self.async_show_form(
             step_id="pair",
             data_schema=probatio.Schema({}),
