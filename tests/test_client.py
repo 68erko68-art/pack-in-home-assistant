@@ -478,60 +478,83 @@ def test_key_ready_only_resumes_when_the_needed_epoch_is_installed():
 
 
 def hello(client, epoch=None, head=7):
-    return json.dumps({
-        "type": "HELLO",
-        "packId": client.state.pack_id,
-        "deviceId": client.api.data["connection_id"],
-        "userId": client.state.user_id,
-        "protocolVersion": 3,
-        "syncGeneration": 3,
-        "authorityMode": "v3",
-        "dataEpoch": client.state.data_epoch if epoch is None else epoch,
-        "headSequence": head,
-        "nextDeviceSequence": 1,
-        "capabilities": CAPABILITIES,
-    })
+    return json.dumps(
+        {
+            "type": "HELLO",
+            "packId": client.state.pack_id,
+            "deviceId": client.api.data["connection_id"],
+            "userId": client.state.user_id,
+            "protocolVersion": 3,
+            "syncGeneration": 3,
+            "authorityMode": "v3",
+            "dataEpoch": client.state.data_epoch if epoch is None else epoch,
+            "headSequence": head,
+            "nextDeviceSequence": 1,
+            "capabilities": CAPABILITIES,
+        }
+    )
 
 
 def restarted_client(client, cache):
     return PackClient(
-        client.api, cache, client.persist, client.changed, client.auth_failed,
+        client.api,
+        cache,
+        client.persist,
+        client.changed,
+        client.auth_failed,
         lambda coro, name: asyncio.create_task(coro, name=name),
     )
 
 
 async def snapshot_row(client, *, complete=True, item=None):
     """A real full-ledger boundary containing a previous-epoch legacy row."""
+
     async def decrypt(frame):
         return task() if item is None else deepcopy(item)
 
     client.log._decrypt = decrypt
     row = {
-        "type": "SNAPSHOT_ROW", "snapshotKind": "EVENT_LOG_V1",
-        "protocolVersion": 3, "syncGeneration": 3,
-        "packId": client.state.pack_id, "dataEpoch": client.state.data_epoch,
+        "type": "SNAPSHOT_ROW",
+        "snapshotKind": "EVENT_LOG_V1",
+        "protocolVersion": 3,
+        "syncGeneration": 3,
+        "packId": client.state.pack_id,
+        "dataEpoch": client.state.data_epoch,
         "originalDataEpoch": client.state.data_epoch - 1,
-        "serverSequence": 1, "eventId": "legacy-event",
-        "actorUserId": "user-a", "actorDeviceId": "phone-a",
-        "eventType": "chore.upserted", "entityType": "legacy_envelope",
-        "entityId": "legacy-event", "entityVersion": 1,
+        "serverSequence": 1,
+        "eventId": "legacy-event",
+        "actorUserId": "user-a",
+        "actorDeviceId": "phone-a",
+        "eventType": "chore.upserted",
+        "entityType": "legacy_envelope",
+        "entityId": "legacy-event",
+        "entityVersion": 1,
         "serverTimestamp": "2026-11-01T23:00:00Z",
     }
     raw = json.dumps(row)
     boundary = {
-        "snapshotKind": "EVENT_LOG_V1", "snapshotDigestAlgorithm": "SHA-256-JSONL",
-        "dataEpoch": client.state.data_epoch, "snapshotHeadSequence": 1,
-        "rowCount": 1, "snapshotId": "snapshot-one",
+        "snapshotKind": "EVENT_LOG_V1",
+        "snapshotDigestAlgorithm": "SHA-256-JSONL",
+        "dataEpoch": client.state.data_epoch,
+        "snapshotHeadSequence": 1,
+        "rowCount": 1,
+        "snapshotId": "snapshot-one",
         "snapshotDigest": hashlib.sha256((raw + "\n").encode()).hexdigest(),
     }
     await client._frame(json.dumps({"type": "SNAPSHOT_BEGIN", **boundary}))
     await client._frame(raw)
     if complete:
         await client._frame(json.dumps({"type": "SNAPSHOT_COMPLETE", **boundary}))
-        await client._frame(json.dumps({
-            "type": "SYNC_COMPLETE", "headSequence": 1,
-            "lastSequence": 1, "hasMore": False,
-        }))
+        await client._frame(
+            json.dumps(
+                {
+                    "type": "SYNC_COMPLETE",
+                    "headSequence": 1,
+                    "lastSequence": 1,
+                    "hasMore": False,
+                }
+            )
+        )
 
 
 def test_first_connection_snapshots_small_previous_epoch_ledger_and_persists_verified_bootstrap():
@@ -721,22 +744,38 @@ def test_signed_own_forbidden_completion_settles_rejected_and_never_success_or_w
             payload = {**original, "completedAt": 1793570400000, "completedByUserId": "user-a"}
             event_id = "haevent-forbidden"
             encoded = client.api.identity.encrypt_event(
-                json.dumps(payload).encode(), b"k" * 32, pack="pack-a", event=event_id,
-                device=client.api.data["connection_id"], sequence=1,
-                event_type="chore.upserted", epoch=1,
+                json.dumps(payload).encode(),
+                b"k" * 32,
+                pack="pack-a",
+                event=event_id,
+                device=client.api.data["connection_id"],
+                sequence=1,
+                event_type="chore.upserted",
+                epoch=1,
             )
             client.outbox = {"wire": {"eventId": event_id}}
             client.workflow = {"parent": "task-a", "phase": "complete"}
             client._result = asyncio.get_running_loop().create_future()
             frame = {
-                "type": "PACK_EVENT", "protocolVersion": 3, "syncGeneration": 3,
-                "packId": "pack-a", "dataEpoch": 1, "serverSequence": 2,
-                "eventId": event_id, "eventType": "chore.upserted",
-                "actorUserId": "user-a", "actorDeviceId": client.api.data["connection_id"],
-                "deviceSequence": 1, "keyEpoch": 1, "entityType": kind,
-                "entityId": wire_id, "entityVersion": 2, "operation": operation,
+                "type": "PACK_EVENT",
+                "protocolVersion": 3,
+                "syncGeneration": 3,
+                "packId": "pack-a",
+                "dataEpoch": 1,
+                "serverSequence": 2,
+                "eventId": event_id,
+                "eventType": "chore.upserted",
+                "actorUserId": "user-a",
+                "actorDeviceId": client.api.data["connection_id"],
+                "deviceSequence": 1,
+                "keyEpoch": 1,
+                "entityType": kind,
+                "entityId": wire_id,
+                "entityVersion": 2,
+                "operation": operation,
                 "serverTimestamp": "2026-11-01T23:00:00Z",
-                "encryptedPayload": encode64(encoded.encode()), "signature": encoded.split(".")[4],
+                "encryptedPayload": encode64(encoded.encode()),
+                "signature": encoded.split(".")[4],
                 "senderSigningPublicKey": client.api.identity.public["signingPublicKey"],
             }
             await client._frame(json.dumps(frame))

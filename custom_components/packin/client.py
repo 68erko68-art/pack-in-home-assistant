@@ -268,9 +268,7 @@ class PackClient:
             if type(next_sequence) is not int or next_sequence < 1:
                 raise IntegrityError("Missing device sequence")
             self.device_sequence = max(self.device_sequence, next_sequence - 1)
-            await self._send(
-                {**self._sync_request(), "capabilities": CAPABILITIES}
-            )
+            await self._send({**self._sync_request(), "capabilities": CAPABILITIES})
             return
         if (
             kind == "MUTATION_REJECTED"

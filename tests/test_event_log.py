@@ -221,17 +221,29 @@ def test_own_application_receipt_is_durable_and_not_added_for_forbidden_completi
 
 def encrypted_frame(identity, sequence, payload, *, actor_device="other-device", version=None):
     value = frame(
-        sequence, identifier=payload["id"], actorDeviceId=actor_device,
+        sequence,
+        identifier=payload["id"],
+        actorDeviceId=actor_device,
         entityVersion=sequence if version is None else version,
     )
     kind, wire, operation = descriptor("chore.upserted", payload)
     encrypted = identity.encrypt_event(
-        encode(payload).encode(), b"k" * 32, pack="pack1", event=value["eventId"],
-        device=actor_device, sequence=sequence, event_type="chore.upserted", epoch=1,
+        encode(payload).encode(),
+        b"k" * 32,
+        pack="pack1",
+        event=value["eventId"],
+        device=actor_device,
+        sequence=sequence,
+        event_type="chore.upserted",
+        epoch=1,
     )
     value.update(
-        entityType=kind, entityId=wire, operation=operation, keyEpoch=1,
-        encryptedPayload=encode64(encrypted.encode()), signature=encrypted.split(".")[4],
+        entityType=kind,
+        entityId=wire,
+        operation=operation,
+        keyEpoch=1,
+        encryptedPayload=encode64(encrypted.encode()),
+        signature=encrypted.split(".")[4],
         senderSigningPublicKey=identity.public["signingPublicKey"],
     )
     value.pop("testPayload")
@@ -242,7 +254,9 @@ def forbidden_pair(identity, *, own=False):
     original = frame(1, identifier="shared")["testPayload"]
     original["historyJson"] = '[{"kind":"packin_task_assignees_v1","userIds":["other"]}]'
     candidate = {
-        **original, "completedAt": 1793570400000, "completedByUserId": "member",
+        **original,
+        "completedAt": 1793570400000,
+        "completedByUserId": "member",
     }
     return (
         encrypted_frame(identity, 1, original),
