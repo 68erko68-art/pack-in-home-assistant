@@ -19,7 +19,17 @@ from .api import PackInApi, PackInApiError
 from .crypto import CryptoError, decode64, encode64
 from .event_log import EventLog, IntegrityError
 from .find_me import decode_locations
-from .protocol import CAPABILITIES, PROTOCOL_VERSION, SYNC_GENERATION, MissingKey, UnsupportedSchema, descriptor
+from .protocol import (
+    CAPABILITIES,
+    LEGACY_CAPABILITIES,
+    LEGACY_COMMAND_MODE,
+    LEGACY_GATEWAY_CAPABILITY,
+    PROTOCOL_VERSION,
+    SYNC_GENERATION,
+    MissingKey,
+    UnsupportedSchema,
+    descriptor,
+)
 from .state import PackState, PermissionDenied, ProjectionError, new_id, occurrence, recurring_advance
 
 BACKOFF = (5, 15, 30, 60, 300, 900)
@@ -51,11 +61,21 @@ class PackClient:
             if cache.get("state")
             else (PackState(data["pack_id"], data["user_id"], data["role"], data["data_epoch"]))
         )
+        if cache.get("state") and not data.get("reauth_reason"):
+            cached_mode = cache.get("authority_mode", "v3")
+            selected_mode = data.get("authority_mode", "v3")
+            if (cached_mode == "legacy" or selected_mode == "legacy") and (
+                cached_mode != selected_mode or state.data_epoch != data["data_epoch"]
+            ):
+                raise UnsupportedSchema("The saved legacy projection and action require their original mode and epoch")
         if state.data_epoch != data["data_epoch"] or data.get("reauth_reason"):
             state = PackState(data["pack_id"], data["user_id"], data["role"], data["data_epoch"])
             cache = {}
         state.role = data["role"]
-        self.log = EventLog(state, self.keys)
+        self.authority_mode = self._selected_mode()
+        if cache.get("state") and cache.get("authority_mode", "v3") != self.authority_mode:
+            raise UnsupportedSchema("The saved projection belongs to another synchronization mode")
+        self.log = EventLog(state, self.keys, authority_mode=self.authority_mode)
         self.log.device_id = data["connection_id"]
         # Older nonempty caches already have an ordered, verified replay cursor.
         # A new/empty projection must bootstrap from the complete event ledger:
@@ -96,6 +116,26 @@ class PackClient:
         self._waiting_epoch: int | None = None
         self._blocked = bool(data.get("reauth_reason"))
         self._workflow_task: asyncio.Task | None = None
+        self._retry_not_before = 0.0
+
+    def _selected_mode(self) -> str:
+        mode = self.api.data.get("authority_mode", "v3")
+        if mode == "legacy":
+            data = self.api.data
+            capabilities = data.get("capabilities")
+            if (
+                data.get("command_mode") != LEGACY_COMMAND_MODE
+                or not isinstance(capabilities, list)
+                or LEGACY_GATEWAY_CAPABILITY not in capabilities
+                or type(data.get("protocol_version")) is not int
+                or data["protocol_version"] != 1
+                or type(data.get("sync_generation")) is not int
+                or data["sync_generation"] != 1
+            ):
+                raise UnsupportedSchema("This legacy connection did not negotiate its gateway")
+        elif mode != "v3":
+            raise UnsupportedSchema("Unsupported Pack authority")
+        return mode
 
     @property
     def state(self) -> PackState:
@@ -124,6 +164,7 @@ class PackClient:
                 "workflow": deepcopy(self.workflow),
                 "device_sequence": self.device_sequence,
                 "bootstrap_verified": not self._needs_snapshot,
+                "authority_mode": self.authority_mode,
             }
             await self.persist(value)
 
@@ -207,9 +248,59 @@ class PackClient:
 
     async def _send_outbox(self) -> None:
         if self.outbox and self.log.synced and not self._waiting_key and self._sent_connection != self._connection_id:
+            # An action's transport is immutable too. Never reroute an old V3
+            # action into the legacy gateway after an unexpected mode change.
+            if (
+                self.outbox.get("authority_mode", "v3") != self.authority_mode
+                or self._selected_mode() != self.authority_mode
+            ):
+                raise UnsupportedSchema("The saved action belongs to another synchronization mode")
             self._sent_connection = self._connection_id
             self.metrics["mutation_sends"] += 1
-            await self._send(self.outbox["wire"])
+            if self.authority_mode == "legacy":
+                wire = self.outbox["wire"]
+                try:
+                    receipt = await self.api.legacy_mutation(wire)
+                except PackInApiError as exc:
+                    if exc.auth_failed:
+                        await self._deny(exc.code)
+                        raise
+                    if self.outbox is None:
+                        # A verified echo may win the race with a lost response.
+                        return
+                    if exc.status == 409 and exc.code in {
+                        "stale_pack_sequence",
+                        "stale_entity_revision",
+                        "key_epoch_changed",
+                    }:
+                        await self._frame(
+                            json.dumps(
+                                {
+                                    "type": "MUTATION_REJECTED",
+                                    "clientMutationId": wire["clientMutationId"],
+                                    "code": exc.code,
+                                }
+                            )
+                        )
+                        return
+                    # The response may have been lost after commit. Keep the
+                    # exact outbox and reconnect through the one existing loop.
+                    self._retry_not_before = time.monotonic() + max(5, exc.retry_after)
+                    if self._ws is not None:
+                        await self._ws.close()
+                    raise
+                # A committed mirror event can arrive while HTTP is in flight.
+                # The ordinary event-log path has already verified and settled it.
+                if self.outbox is not None and (
+                    receipt.get("type") != "MUTATION_ACCEPTED"
+                    or receipt.get("eventId") != self.outbox["wire"]["eventId"]
+                    or receipt.get("clientMutationId") != self.outbox["wire"]["clientMutationId"]
+                    or type(receipt.get("serverSequence")) is not int
+                    or receipt["serverSequence"] < 1
+                ):
+                    raise IntegrityError("The legacy command receipt does not match the saved action")
+            else:
+                await self._send(self.outbox["wire"])
 
     async def _settle_receipt(self) -> None:
         if not self.outbox:
@@ -243,17 +334,31 @@ class PackClient:
             raise IntegrityError("Invalid server frame")
         kind = frame.get("type")
         if kind == "HELLO":
+            mode = self._selected_mode()
+            legacy = mode == "legacy"
+            if mode != self.authority_mode:
+                raise UnsupportedSchema("The Pack synchronization mode changed")
             if (
                 frame.get("packId") != self.state.pack_id
                 or frame.get("deviceId") != self.api.data["connection_id"]
                 or frame.get("userId") != self.state.user_id
-                or frame.get("protocolVersion") != PROTOCOL_VERSION
-                or frame.get("syncGeneration") != SYNC_GENERATION
-                or frame.get("authorityMode") != "v3"
+                or frame.get("protocolVersion") != (1 if legacy else PROTOCOL_VERSION)
+                or frame.get("syncGeneration") != (1 if legacy else SYNC_GENERATION)
+                or frame.get("authorityMode") != mode
             ):
                 raise UnsupportedSchema("Unsupported Pack-In synchronization")
-            if not set(CAPABILITIES[:-1]) <= set(frame.get("capabilities", [])):
+            required = LEGACY_CAPABILITIES if legacy else CAPABILITIES[:-1]
+            capabilities = frame.get("capabilities")
+            if not isinstance(capabilities, list) or not set(required) <= set(capabilities):
                 raise UnsupportedSchema("Required synchronization capabilities are missing")
+            if legacy and (
+                frame.get("commandMode") != LEGACY_COMMAND_MODE
+                or type(frame.get("protocolVersion")) is not int
+                or type(frame.get("syncGeneration")) is not int
+            ):
+                raise UnsupportedSchema("The legacy gateway was not negotiated")
+            if legacy and frame.get("dataEpoch") != self.state.data_epoch:
+                raise UnsupportedSchema("The legacy Pack epoch changed; the saved action is held")
             if frame.get("dataEpoch") != self.state.data_epoch:
                 # A reset invalidates queued actions as well as the old cache.
                 self.outbox = self.workflow = None
@@ -268,7 +373,7 @@ class PackClient:
             if type(next_sequence) is not int or next_sequence < 1:
                 raise IntegrityError("Missing device sequence")
             self.device_sequence = max(self.device_sequence, next_sequence - 1)
-            await self._send({**self._sync_request(), "capabilities": CAPABILITIES})
+            await self._send({**self._sync_request(), "capabilities": LEGACY_CAPABILITIES if legacy else CAPABILITIES})
             return
         if (
             kind == "MUTATION_REJECTED"
@@ -448,6 +553,7 @@ class PackClient:
             self._notify()
             failures = 0 if time.monotonic() - started > 300 else failures + 1
             self.metrics["reconnect_waits"] += 1
+            delay = max(delay, self._retry_not_before - time.monotonic())
             await asyncio.sleep(delay * random.uniform(1.0, 1.2))
 
     async def _recover_handshake(self) -> bool:
@@ -466,7 +572,8 @@ class PackClient:
             # A failed network metadata check uses the ordinary bounded backoff.
             return False
         if (
-            result.get("authorityMode") != "v3"
+            self.authority_mode != "v3"
+            or result.get("authorityMode") != "v3"
             or result.get("protocolVersion") != PROTOCOL_VERSION
             or result.get("syncGeneration") != SYNC_GENERATION
             or type(result.get("dataEpoch")) is not int
@@ -607,7 +714,7 @@ class PackClient:
             "signature": encoded.split(".")[4],
             "senderSigningPublicKey": self.api.identity.public["signingPublicKey"],
         }
-        self.outbox = {"wire": wire}
+        self.outbox = {"wire": wire, "authority_mode": self.authority_mode}
         self._sent_connection = None
         self._result = asyncio.get_running_loop().create_future()
         self._result.add_done_callback(lambda future: future.exception() if not future.cancelled() else None)

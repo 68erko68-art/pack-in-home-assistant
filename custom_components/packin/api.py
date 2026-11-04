@@ -17,7 +17,7 @@ from uuid import uuid4
 import aiohttp
 
 from .crypto import DeviceIdentity, CryptoError, decode64, encode64, verify, wrap_context
-from .protocol import PROTOCOL_VERSION, SYNC_GENERATION
+from .protocol import LEGACY_COMMAND_MODE, LEGACY_GATEWAY_CAPABILITY, PROTOCOL_VERSION, SYNC_GENERATION
 
 API_ORIGIN = "https://pack-in-beta-api.68erko68.workers.dev"
 PREFIX = "/api/ha/v1"
@@ -86,6 +86,7 @@ def new_pairing(display_name: str, scopes: list[str]) -> Pairing:
             "displayName": display_name.strip()[:80] or "Home Assistant",
             **{key: value for key, value in identity.public.items() if key != "keyAlgorithm"},
             "scopes": selected,
+            "capabilities": [LEGACY_GATEWAY_CAPABILITY],
         },
     )
 
@@ -233,6 +234,19 @@ class PackInApi:
         return PREFIX + "/connections/" + identifier
 
     async def _merge_metadata(self, result: dict[str, Any]) -> None:
+        mode = result.get("authorityMode")
+        if mode is not None and mode not in {"v3", "legacy"}:
+            raise PackInApiError("unsupported_synchronization_mode", 409)
+        if mode == "legacy" and (
+            result.get("commandMode") != LEGACY_COMMAND_MODE
+            or not isinstance(result.get("capabilities"), list)
+            or LEGACY_GATEWAY_CAPABILITY not in result["capabilities"]
+            or type(result.get("protocolVersion")) is not int
+            or result.get("protocolVersion") != 1
+            or type(result.get("syncGeneration")) is not int
+            or result.get("syncGeneration") != 1
+        ):
+            raise PackInApiError("unsupported_synchronization_mode", 409)
         mapping = {
             "packId": "pack_id",
             "userId": "user_id",
@@ -246,6 +260,10 @@ class PackInApi:
             "refreshExpiresAt": "refresh_expires_at_ms",
             "members": "members",
             "authorityMode": "authority_mode",
+            "commandMode": "command_mode",
+            "capabilities": "capabilities",
+            "protocolVersion": "protocol_version",
+            "syncGeneration": "sync_generation",
         }
         for remote, local in mapping.items():
             if remote in result:
@@ -319,16 +337,27 @@ class PackInApi:
         self.metrics["location_batches"] += 1
         return await self.request("GET", "/locations")
 
+    async def legacy_mutation(self, wire: dict[str, Any]) -> dict[str, Any]:
+        """Submit the saved native envelope; only its verified mirror can settle it."""
+        if (
+            self.data.get("authority_mode") != "legacy"
+            or self.data.get("command_mode") != LEGACY_COMMAND_MODE
+            or LEGACY_GATEWAY_CAPABILITY not in self.data.get("capabilities", [])
+        ):
+            raise PackInApiError("unsupported_synchronization_mode", 409)
+        return await self.request("POST", "/legacy-mutations", wire)
+
     async def websocket(self) -> aiohttp.ClientWebSocketResponse:
         await self.ensure_session()
         epoch = self.data.get("data_epoch")
         if type(epoch) is not int or epoch < 1:
             raise PackInApiError("invalid_data_epoch")
+        legacy = self.data.get("authority_mode") == "legacy"
         path = (
             self.connection_path
             + "/realtime?protocolVersion="
-            + str(PROTOCOL_VERSION)
-            + ("&syncGeneration=" + str(SYNC_GENERATION) + "&dataEpoch=" + str(epoch))
+            + str(1 if legacy else PROTOCOL_VERSION)
+            + ("&syncGeneration=" + str(1 if legacy else SYNC_GENERATION) + "&dataEpoch=" + str(epoch))
         )
         headers = self._headers("GET", path, b"", self.data["access_token"], "PackInHA")
         self.metrics["websocket_handshakes"] += 1

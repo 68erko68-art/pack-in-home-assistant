@@ -11,6 +11,15 @@ from .crypto import CryptoError, decode64, decrypt_event
 
 PROTOCOL_VERSION = 3
 SYNC_GENERATION = 3
+LEGACY_GATEWAY_CAPABILITY = "HA_LEGACY_D1_GATEWAY_V1"
+LEGACY_COMMAND_MODE = "legacy_d1_gateway"
+LEGACY_CAPABILITIES = [
+    "EVENT_LOG_SNAPSHOT_V1",
+    "SNAPSHOT_DIGEST_V1",
+    "UNSUPPORTED_SCHEMA_HOLD_V1",
+    "SCOPED_EVENT_LOG_V1",
+    LEGACY_GATEWAY_CAPABILITY,
+]
 CAPABILITIES = [
     "CLIENT_MUTATION_RECONCILIATION_V1",
     "DEVICE_SEQUENCE_V1",
@@ -89,11 +98,19 @@ class DecodedEvent:
     entity_version: int
 
 
-def decode_event(frame: dict[str, Any], pack_id: str, pack_keys: dict[int, bytes]) -> dict[str, Any]:
+def decode_event(
+    frame: dict[str, Any], pack_id: str, pack_keys: dict[int, bytes], *, authority_mode: str = "v3"
+) -> dict[str, Any]:
     if frame.get("packId") != pack_id:
         raise CryptoError("Event belongs to another Pack")
-    if frame.get("protocolVersion") != PROTOCOL_VERSION or frame.get("syncGeneration") != SYNC_GENERATION:
+    version = 1 if authority_mode == "legacy" else PROTOCOL_VERSION
+    generation = 1 if authority_mode == "legacy" else SYNC_GENERATION
+    if authority_mode not in {"v3", "legacy"}:
+        raise UnsupportedSchema("Unsupported Pack authority")
+    if frame.get("protocolVersion") != version or frame.get("syncGeneration") != generation:
         raise UnsupportedSchema("Install the current Pack-In integration")
+    if authority_mode == "legacy" and frame.get("entityType") != "legacy_envelope":
+        raise UnsupportedSchema("A native legacy envelope is required")
     epoch = frame.get("keyEpoch")
     if type(epoch) is not int or epoch < 1:
         raise CryptoError("Invalid Pack key epoch")

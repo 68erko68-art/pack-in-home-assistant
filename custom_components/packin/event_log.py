@@ -24,8 +24,13 @@ class EventLog:
         state: PackState,
         keys: Callable[[], dict[int, bytes]],
         decrypt: Callable[..., Awaitable[dict[str, Any]]] | None = None,
+        *,
+        authority_mode: str = "v3",
     ) -> None:
         self.state = state
+        if authority_mode not in {"v3", "legacy"}:
+            raise UnsupportedSchema("Unsupported Pack authority")
+        self.authority_mode = authority_mode
         self.keys = keys
         self.metrics: Counter[str] = Counter()
         self.synced = False
@@ -36,7 +41,9 @@ class EventLog:
         self._decrypt = decrypt or self._decode
 
     async def _decode(self, frame: dict[str, Any]) -> dict[str, Any]:
-        return await asyncio.to_thread(decode_event, frame, self.state.pack_id, self.keys())
+        return await asyncio.to_thread(
+            decode_event, frame, self.state.pack_id, self.keys(), authority_mode=self.authority_mode
+        )
 
     @staticmethod
     def _integer(value: Any, minimum: int = 0) -> int:
@@ -68,10 +75,9 @@ class EventLog:
     def _envelope_metadata(self, frame: dict[str, Any]) -> int:
         if frame.get("dataEpoch") != self.state.data_epoch:
             raise IntegrityError("Event data epoch does not match")
-        if (
-            frame.get("protocolVersion", PROTOCOL_VERSION) != PROTOCOL_VERSION
-            or frame.get("syncGeneration", SYNC_GENERATION) != SYNC_GENERATION
-        ):
+        version = 1 if self.authority_mode == "legacy" else PROTOCOL_VERSION
+        generation = 1 if self.authority_mode == "legacy" else SYNC_GENERATION
+        if frame.get("protocolVersion", version) != version or frame.get("syncGeneration", generation) != generation:
             raise UnsupportedSchema("Unsupported event-log protocol")
         return self._integer(frame.get("serverSequence"), 1)
 
@@ -81,7 +87,12 @@ class EventLog:
             return
         payload = await self._decrypt(frame)
         if frame.get("actorDeviceId") == getattr(self, "device_id", None):
-            target.device_sequence = max(target.device_sequence, self._integer(frame.get("deviceSequence"), 1))
+            sequence = frame.get("deviceSequence")
+            if frame.get("entityType") == "legacy_envelope":
+                # Native signature verification above binds this original
+                # sequence; the mirror's own row sequence is not its identity.
+                sequence = frame.get("encryption", {}).get("deviceSequence")
+            target.device_sequence = max(target.device_sequence, self._integer(sequence, 1))
         try:
             target.apply(
                 frame["eventType"],

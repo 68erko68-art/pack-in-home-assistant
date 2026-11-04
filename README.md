@@ -2,7 +2,9 @@
 
 Native chores, groceries, calendar and consenting member locations, with end-to-end encryption.
 
-**Development preview. Cloud linking is not enabled in production yet. No production-ready release is claimed.**
+**Development preview.** Cloud linking requires a Premium account and approval in the Pack-In phone app.
+Version 0.1.1 adds compatibility with existing legacy Packs. Real-household acceptance is still in progress;
+no production-ready release is claimed.
 The current implementation is being verified against Home Assistant 2026.10.4.
 Local protocol tests are not a substitute for installing and testing with real phones and Home Assistant.
 
@@ -18,7 +20,7 @@ Each member must separately enable sharing their own Find Me location with that 
 
 ## Install with HACS
 
-Once a verified prerelease is available:
+For a published prerelease:
 
 1. Open HACS → Custom repositories.
 2. Add `https://github.com/68erko68-art/pack-in-home-assistant`, category **Integration**.
@@ -66,6 +68,8 @@ Find Me trackers work with normal Home Assistant zones. Stored private Pack-In a
 
 Tasks, groceries and calendar share one event-driven WebSocket per Pack.
 There is **no periodic full-data polling** for those categories and no network access in entity property getters.
+Legacy Packs keep their existing authority, encryption keys and sync epoch. Their signed actions use a scoped
+gateway that checks for concurrent native changes; connecting a home never resets the Pack.
 Replay resumes from the last verified sequence. A snapshot replaces local state only after its complete digest matches.
 An immutable encrypted action is saved before sending; uncertain actions are not rewritten and retried as new actions.
 
