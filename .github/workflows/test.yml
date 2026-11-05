@@ -3,6 +3,12 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      source_built_harness:
+        description: Supplementary tests with the pinned official source-built harness
+        type: boolean
+        default: false
+        required: false
 permissions:
   contents: read
 concurrency:
@@ -10,7 +16,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   home-assistant:
-    name: HA (${{ matrix.os }})
+    name: ${{ inputs.source_built_harness && format('Supplementary HA source harness ({0})', matrix.os) || format('HA ({0})', matrix.os) }}
     strategy:
       fail-fast: false
       matrix:
@@ -18,14 +24,90 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source_built_harness && '1f87eb3e400bbe7b3ad43f948684946d4ca666d8' || github.sha }}
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: "3.14.2"
           cache: pip
-      - run: python -m pip install -r requirements-test.txt
+      - name: Check out the exact official stable harness source
+        if: ${{ inputs.source_built_harness }}
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: home-assistant/core
+          ref: 74cf5a49c63ed8d4d87717844bf14f79c28c9cea
+          path: .ha-source
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /packages/pytest-homeassistant/
+            /packages/package_release.py
+            /pyproject.toml
+      - name: Build the official stable harness for supplementary tests
+        if: ${{ inputs.source_built_harness }}
+        run: |
+          test "$(git rev-parse HEAD)" = 1f87eb3e400bbe7b3ad43f948684946d4ca666d8
+          test "$(git -C .ha-source rev-parse HEAD)" = 74cf5a49c63ed8d4d87717844bf14f79c28c9cea
+          python -m pip install build==1.3.0
+          cd .ha-source
+          python -m packages.package_release
+          python -m build --wheel packages/pytest-homeassistant --outdir "$RUNNER_TEMP/packin-ha-wheel"
+      - name: Install published test dependencies
+        if: ${{ !inputs.source_built_harness }}
+        run: python -m pip install -r requirements-test.txt
+      - name: Install supplementary source harness with all pinned dependencies
+        if: ${{ inputs.source_built_harness }}
+        run: python -m pip install "$RUNNER_TEMP/packin-ha-wheel/pytest_homeassistant-2026.11.0-py3-none-any.whl" -r requirements-test.txt
+      - name: Verify installed dependencies and record provenance
+        env:
+          SOURCE_BUILT_HARNESS: ${{ inputs.source_built_harness }}
+        run: |
+          python -m pip check > dependency-check.txt
+          cat dependency-check.txt
+          python -m pip list --format=json > installed-dependencies.json
+          python - <<'PY'
+          from pathlib import Path
+          import hashlib
+          import importlib.metadata
+          import json
+          import os
+          import platform
+          import subprocess
+          import sys
+
+          source_built = os.environ.get("SOURCE_BUILT_HARNESS") == "true"
+          tested_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          versions = {name: importlib.metadata.version(name) for name in ("homeassistant", "pytest-homeassistant")}
+          assert versions == {"homeassistant": "2026.11.0", "pytest-homeassistant": "2026.11.0"}
+          assert sys.version_info[:3] == (3, 14, 2)
+          record = {
+              "testedCommit": tested_commit,
+              "python": platform.python_version(),
+              "architecture": platform.machine(),
+              "platform": platform.system(),
+              "versions": versions,
+              "sourceBuiltHarness": source_built,
+              "supplementaryOnly": source_built,
+          }
+          if source_built:
+              assert tested_commit == "1f87eb3e400bbe7b3ad43f948684946d4ca666d8"
+              harness_commit = subprocess.check_output(["git", "-C", ".ha-source", "rev-parse", "HEAD"], text=True).strip()
+              assert harness_commit == "74cf5a49c63ed8d4d87717844bf14f79c28c9cea"
+              wheel = Path(os.environ["RUNNER_TEMP"]) / "packin-ha-wheel/pytest_homeassistant-2026.11.0-py3-none-any.whl"
+              record.update(harnessSourceCommit=harness_commit, harnessWheelSha256=hashlib.sha256(wheel.read_bytes()).hexdigest())
+          Path("qualification-provenance.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+          print(json.dumps(record))
+          PY
       - run: python -m pytest tests --junitxml=results.xml --timeout=90
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
           name: test-results-${{ matrix.os }}
-          path: results.xml
+          path: |
+            results.xml
+            qualification-provenance.json
+            dependency-check.txt
+            installed-dependencies.json
+
+# Source-built runs add Linux lifecycle evidence only. They do not satisfy the
+# unchanged strict release audit or authorize publication.
