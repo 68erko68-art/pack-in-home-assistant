@@ -110,7 +110,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             raise ConfigEntryError("This Pack needs a supported synchronization upgrade in Pack-In") from None
         raise ConfigEntryNotReady("Pack-In is temporarily unavailable") from None
 
-    if api.data.get("authority_mode") != "v3":
+    if api.data.get("authority_mode") not in {"v3", "legacy"}:
         raise ConfigEntryError("This Pack needs a supported synchronization upgrade in Pack-In")
 
     encrypted = await store.async_load()

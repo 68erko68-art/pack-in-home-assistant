@@ -40,8 +40,9 @@ def config():
     }
 
 
-async def setup_entry(hass, cache_connection_id=None):
+async def setup_entry(hass, cache_connection_id=None, *, authority_mode="v3"):
     data = config()
+    data["authority_mode"] = authority_mode
     entry = MockConfigEntry(domain="packin", unique_id="test-pack", title="Test family", data=data)
     entry.add_to_hass(hass)
     state = PackState("test-pack", "test-user", "member")
@@ -64,7 +65,10 @@ async def setup_entry(hass, cache_connection_id=None):
     }
     from custom_components.packin.crypto import decode64
 
-    sealed = seal_cache({"state": state.export()}, decode64(data["cache_key"]), "test-pack")
+    cache = {"state": state.export()}
+    if authority_mode == "legacy":
+        cache["authority_mode"] = authority_mode
+    sealed = seal_cache(cache, decode64(data["cache_key"]), "test-pack")
     await Store(hass, 1, "packin." + entry.entry_id, private=True).async_save(
         {"sealed": sealed, "connection_id": cache_connection_id or data["connection_id"]}
     )
@@ -85,8 +89,11 @@ async def setup_entry(hass, cache_connection_id=None):
     return entry
 
 
-async def test_native_entities_load_and_unload_without_network(hass):
-    entry = await setup_entry(hass)
+@pytest.mark.parametrize("authority_mode", ["v3", "legacy"])
+async def test_native_entities_load_and_unload_without_network(hass, authority_mode):
+    entry = await setup_entry(hass, authority_mode=authority_mode)
+    assert entry.runtime_data.client.authority_mode == authority_mode
+    assert "milk" in entry.runtime_data.client.state.groceries
     assert len([x for x in hass.states.async_all("todo")]) == 2  # Optional whole-Pack list disabled.
     assert len(hass.states.async_all("calendar")) == 1
     assert len(hass.states.async_all("device_tracker")) == 1
