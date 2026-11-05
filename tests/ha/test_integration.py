@@ -9,6 +9,7 @@ import pytest
 
 from homeassistant.components.todo import TodoItem, TodoItemStatus
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import entity_registry
 from homeassistant.helpers.storage import Store
 from pytest_homeassistant.common import MockConfigEntry
 
@@ -242,3 +243,86 @@ async def test_flow_recovers_lost_claim_response_using_same_claim_intent(hass, f
         result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
         assert result["type"] == FlowResultType.CREATE_ENTRY
         assert calls[0] == calls[1]
+
+
+@pytest.mark.parametrize("authority_mode", ["v3", "legacy"])
+async def test_native_reload_preserves_pairing_cache_pending_actions_and_entity_identity(hass, authority_mode):
+    """Exercise real HA reload and sealed storage while background transport stays stopped."""
+    entry = await setup_entry(hass, authority_mode=authority_mode)
+    original_client = entry.runtime_data.client
+    original_entry_id = entry.entry_id
+    original_unique_id = entry.unique_id
+    original_data = deepcopy(dict(entry.data))
+    original_identity = original_client.api.identity.export()
+    original_keys = original_client.keys()
+    registry = entity_registry.async_get(hass)
+
+    def registered_entities():
+        return {
+            (item.entity_id, item.unique_id, item.device_id)
+            for item in entity_registry.async_entries_for_config_entry(registry, original_entry_id)
+        }
+
+    original_registry = registered_entities()
+    assert original_registry
+    registered_ids = {entity_id for entity_id, _, _ in original_registry}
+    original_loaded_ids = {state.entity_id for state in hass.states.async_all()} & registered_ids
+    assert original_loaded_ids
+
+    original_client.state.last_sequence = 12
+    original_client.device_sequence = 7
+    original_client._needs_snapshot = False
+    # These envelopes are opaque to persistence; the transport must not replay them during reload.
+    original_client.outbox = {"wire": {"type": "MUTATE", "eventId": "pending-reload-action"}}
+    original_client.workflow = {
+        "parent": "task-a",
+        "due": 1793574000000,
+        "recurrence": "daily",
+        "now": 1793574000000,
+        "phase": "normalize",
+    }
+    expected_state = deepcopy(original_client.state.export())
+    expected_outbox = deepcopy(original_client.outbox)
+    expected_workflow = deepcopy(original_client.workflow)
+    await original_client._save()
+
+    metadata_calls = []
+
+    async def metadata(api):
+        metadata_calls.append(deepcopy(api.data))
+        return dict(api.data)
+
+    try:
+        with (
+            patch("custom_components.packin.api.PackInApi.metadata", metadata),
+            patch("custom_components.packin.client.PackClient.start") as start,
+            patch("custom_components.packin.api.PackInApi.start_pairing", new_callable=AsyncMock) as pair,
+            patch("custom_components.packin.api.PackInApi.claim_pairing", new_callable=AsyncMock) as claim,
+        ):
+            assert await hass.config_entries.async_reload(original_entry_id)
+            await hass.async_block_till_done()
+            start.assert_called_once()
+            pair.assert_not_awaited()
+            claim.assert_not_awaited()
+
+        assert hass.config_entries.async_get_entry(original_entry_id) is entry
+        assert entry.unique_id == original_unique_id
+        assert dict(entry.data) == original_data
+        assert metadata_calls == [original_data]
+        reloaded = entry.runtime_data.client
+        assert reloaded is not original_client
+        assert original_client._stopping
+        assert reloaded.authority_mode == authority_mode
+        assert reloaded.api.identity.export() == original_identity
+        assert reloaded.keys() == original_keys
+        assert reloaded.state.export() == expected_state
+        assert reloaded.device_sequence == 7
+        assert not reloaded._needs_snapshot
+        assert reloaded.outbox == expected_outbox
+        assert reloaded.workflow == expected_workflow
+        assert registered_entities() == original_registry
+        assert {state.entity_id for state in hass.states.async_all()} & registered_ids == original_loaded_ids
+        assert len(list(hass.config_entries.async_loaded_entries("packin"))) == 1
+    finally:
+        await hass.config_entries.async_unload(entry.entry_id)
+        await hass.async_block_till_done()
