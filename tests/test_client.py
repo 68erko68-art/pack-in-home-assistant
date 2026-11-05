@@ -248,6 +248,73 @@ def test_consent_removal_clears_location_immediately_and_diagnostics_redact():
     run(scenario())
 
 
+@pytest.mark.parametrize("pause_at", ["request", "decode"])
+@pytest.mark.parametrize("control", ["unavailable", "consent", "removed"])
+def test_location_clear_during_refresh_cannot_restore_old_position(monkeypatch, pause_at, control):
+    async def scenario():
+        session, client, _, _, _ = await client_fixture()
+        client.api.data["members"] = [
+            {"userId": "user-a", "locationConsent": True},
+            {"userId": "user-b", "locationConsent": True},
+        ]
+        client.locations = {"user-a": "previous-a", "user-b": "previous-b"}
+        client._last_location_attempt = client_module.time.monotonic() - 61
+        paused = asyncio.Event()
+        release = asyncio.Event()
+        calls = []
+        real_to_thread = asyncio.to_thread
+
+        async def wait_for_clear():
+            paused.set()
+            await release.wait()
+
+        async def locations():
+            calls.append(True)
+            if pause_at == "request":
+                await wait_for_clear()
+            return {"locations": []}
+
+        def decode(_, pack_id, keys, allowed, now):
+            return {user_id: "response-" + user_id for user_id in allowed}
+
+        async def to_thread(function, *args):
+            if function is decode and pause_at == "decode":
+                await wait_for_clear()
+            return await real_to_thread(function, *args)
+
+        monkeypatch.setattr(client.api, "locations", locations)
+        monkeypatch.setattr(client_module, "decode_locations", decode)
+        monkeypatch.setattr(asyncio, "to_thread", to_thread)
+        refresh = asyncio.create_task(client.refresh_locations())
+        try:
+            await asyncio.wait_for(paused.wait(), timeout=2)
+            frame = {
+                "type": {
+                    "unavailable": "HOME_ASSISTANT_LOCATION_UNAVAILABLE",
+                    "consent": "HOME_ASSISTANT_LOCATION_CONSENT",
+                    "removed": "HOME_ASSISTANT_MEMBER_REMOVED",
+                }[control],
+                "userId": "user-a",
+                "enabled": False,
+            }
+            await client._frame(json.dumps(frame))
+            assert client.locations == {"user-b": "previous-b"}
+            if control == "consent":
+                # A new grant must not make a response to an old request current.
+                await client._frame(json.dumps({**frame, "enabled": True}))
+            release.set()
+            await asyncio.wait_for(refresh, timeout=2)
+            assert client.locations == {"user-b": "response-user-b"}
+            await client.refresh_locations()
+            assert calls == [True]
+        finally:
+            refresh.cancel()
+            await asyncio.gather(refresh, return_exceptions=True)
+            await session.close()
+
+    run(scenario())
+
+
 def test_no_location_request_when_disabled_no_consent_or_cooldown():
     async def scenario():
         session, client, _, _, _ = await client_fixture()

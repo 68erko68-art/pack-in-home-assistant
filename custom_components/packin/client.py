@@ -104,6 +104,7 @@ class PackClient:
         self._save_lock = asyncio.Lock()
         self._actions = asyncio.Lock()
         self._location_lock = asyncio.Lock()
+        self._location_invalidations: set[str] | None = None
         self._key_request_lock = asyncio.Lock()
         self._wake_locations = asyncio.Event()
         self._last_location_attempt = 0.0
@@ -152,6 +153,11 @@ class PackClient:
 
     def keys(self) -> dict[int, bytes]:
         return {int(key): decode64(value, 32) for key, value in self.api.data.get("pack_keys", {}).items()}
+
+    def _invalidate_location(self, user_id: str) -> None:
+        self.locations.pop(user_id, None)
+        if self._location_invalidations is not None:
+            self._location_invalidations.add(user_id)
 
     def _notify(self) -> None:
         self.changed()
@@ -398,6 +404,9 @@ class PackClient:
             return
         if kind == "HOME_ASSISTANT_LOCATION_CONSENT":
             user_id = frame.get("userId")
+            if not isinstance(user_id, str):
+                return
+            self._invalidate_location(user_id)
             if (
                 frame.get("enabled") is True
                 and not any(m.get("userId") == user_id for m in self.api.data.get("members", []))
@@ -408,13 +417,14 @@ class PackClient:
             for member in self.api.data.get("members", []):
                 if member.get("userId") == user_id:
                     member["locationConsent"] = frame.get("enabled") is True
-            self.locations.pop(user_id, None)
             self._wake_locations.set()
             self._notify()
             return
         if kind in {"HOME_ASSISTANT_LOCATION_UNAVAILABLE", "HOME_ASSISTANT_MEMBER_REMOVED"}:
             user_id = frame.get("userId")
-            self.locations.pop(user_id, None)
+            if not isinstance(user_id, str):
+                return
+            self._invalidate_location(user_id)
             if kind == "HOME_ASSISTANT_MEMBER_REMOVED":
                 self.api.data["members"] = [m for m in self.api.data.get("members", []) if m.get("userId") != user_id]
             self._notify()
@@ -546,6 +556,9 @@ class PackClient:
                 self.error = "network_unavailable"
             finally:
                 self._ready.clear()
+                if self.locations:
+                    self.locations.clear()
+                    self._notify()
                 if self._ws is not None:
                     await self._ws.close()
                 self._ws = None
@@ -627,20 +640,42 @@ class PackClient:
                 self._blocked
                 or not self.location_interval
                 or not self.available
+                or not self._ready.is_set()
                 or "locations:read" not in self.api.data.get("scopes", [])
                 or not any(m.get("locationConsent") for m in self.api.data.get("members", []))
                 or time.monotonic() - self._last_location_attempt < 60
             ):
                 return
             self._last_location_attempt = time.monotonic()
-            result = await self.api.locations()
-            now = datetime.now(timezone.utc)
-            allowed = {m["userId"] for m in self.api.data.get("members", []) if m.get("locationConsent")}
-            self.locations = await asyncio.to_thread(
-                decode_locations, result.get("locations", []), self.state.pack_id, self.keys(), allowed, now
-            )
-            self.last_location_fetch = now
-            self._notify()
+            connection_id = self._connection_id
+            invalidated: set[str] = set()
+            self._location_invalidations = invalidated
+            try:
+                result = await self.api.locations()
+                now = datetime.now(timezone.utc)
+                allowed = {m["userId"] for m in self.api.data.get("members", []) if m.get("locationConsent")}
+                locations = await asyncio.to_thread(
+                    decode_locations, result.get("locations", []), self.state.pack_id, self.keys(), allowed, now
+                )
+                if (
+                    not self.available
+                    or not self._ready.is_set()
+                    or self._connection_id != connection_id
+                    or not self.location_interval
+                    or "locations:read" not in self.api.data.get("scopes", [])
+                ):
+                    return
+                allowed = {m["userId"] for m in self.api.data.get("members", []) if m.get("locationConsent")}
+                # A clear received during this request wins over its older response.
+                self.locations = {
+                    user_id: location
+                    for user_id, location in locations.items()
+                    if user_id in allowed and user_id not in invalidated
+                }
+                self.last_location_fetch = now
+                self._notify()
+            finally:
+                self._location_invalidations = None
 
     async def _location_loop(self) -> None:
         while not self._stopping and not self._blocked:
