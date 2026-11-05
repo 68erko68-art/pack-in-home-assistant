@@ -14,6 +14,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.packin.api import SCOPES
 from custom_components.packin.crypto import DeviceIdentity, encode64, seal_cache
+from custom_components.packin.protocol import LEGACY_COMMAND_MODE, LEGACY_GATEWAY_CAPABILITY
 from custom_components.packin.state import PackState
 
 pytestmark = pytest.mark.usefixtures("enable_custom_integrations")
@@ -43,6 +44,13 @@ def config():
 async def setup_entry(hass, cache_connection_id=None, *, authority_mode="v3"):
     data = config()
     data["authority_mode"] = authority_mode
+    if authority_mode == "legacy":
+        data.update(
+            command_mode=LEGACY_COMMAND_MODE,
+            capabilities=[LEGACY_GATEWAY_CAPABILITY],
+            protocol_version=1,
+            sync_generation=1,
+        )
     entry = MockConfigEntry(domain="packin", unique_id="test-pack", title="Test family", data=data)
     entry.add_to_hass(hass)
     state = PackState("test-pack", "test-user", "member")
