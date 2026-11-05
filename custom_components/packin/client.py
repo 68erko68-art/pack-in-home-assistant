@@ -475,6 +475,7 @@ class PackClient:
         while not self._stopping and not self._blocked:
             started = time.monotonic()
             delay = BACKOFF[min(failures, len(BACKOFF) - 1)]
+            retry_after = 0
             try:
                 self.status = "connecting"
                 self._notify()
@@ -514,7 +515,8 @@ class PackClient:
                     await self.api.ensure_session(force=True)
             except PackInApiError as exc:
                 self.error = exc.code
-                delay = max(delay, exc.retry_after)
+                retry_after = exc.retry_after
+                delay = max(delay, retry_after)
                 if exc.status == 409:
                     # Refresh once only when the server proves a new data epoch.
                     # Unsupported Packs/protocols must not become retry storms.
@@ -551,7 +553,11 @@ class PackClient:
                 break
             self.status = "offline"
             self._notify()
-            failures = 0 if time.monotonic() - started > 300 else failures + 1
+            if time.monotonic() - started > 300:
+                failures = 0
+                delay = max(BACKOFF[0], retry_after)
+            else:
+                failures += 1
             self.metrics["reconnect_waits"] += 1
             delay = max(delay, self._retry_not_before - time.monotonic())
             await asyncio.sleep(delay * random.uniform(1.0, 1.2))

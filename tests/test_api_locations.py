@@ -23,7 +23,7 @@ def loopback_transport_only(request):
     # retain the destination guard so these transport tests can reach only loopback.
     import importlib.util
 
-    if importlib.util.find_spec("pytest_homeassistant_custom_component") is not None:
+    if importlib.util.find_spec("pytest_homeassistant") is not None:
         request.getfixturevalue("socket_enabled")
         import pytest_socket
 

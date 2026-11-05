@@ -10,7 +10,7 @@ import pytest
 from homeassistant.components.todo import TodoItem, TodoItemStatus
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers.storage import Store
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant.common import MockConfigEntry
 
 from custom_components.packin.api import SCOPES
 from custom_components.packin.crypto import DeviceIdentity, encode64, seal_cache

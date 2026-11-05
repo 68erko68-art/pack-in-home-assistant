@@ -2,6 +2,7 @@
 
 import asyncio
 from copy import deepcopy
+from types import SimpleNamespace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -9,6 +10,7 @@ import json
 import aiohttp
 import pytest
 
+from packin_pure import client as client_module
 from packin_pure.api import PackInApi, PackInApiError, SCOPES
 from packin_pure.client import PackClient, ActionPending, Conflict
 from packin_pure.crypto import DeviceIdentity, encode64
@@ -801,6 +803,74 @@ def test_signed_own_forbidden_completion_settles_rejected_and_never_success_or_w
             assert restarted.outbox is None and restarted.workflow is None
             assert restarted.metrics["mutations_verified"] == 0
             assert restarted.metrics["mutations_rejected"] == 1
+        finally:
+            await session.close()
+
+    run(scenario())
+
+
+@pytest.mark.parametrize(
+    "retry_after,cooldown,expected",
+    [(0, 0, 5), (120, 0, 120), (0, 45, 45), (120, 180, 180)],
+)
+def test_recovered_connection_resets_backoff_without_shortening_retry_floors(
+    monkeypatch, retry_after, cooldown, expected
+):
+    async def scenario():
+        session, client, _, _, denied = await client_fixture()
+        now = [1000.0]
+        waits = []
+        attempts = []
+        renewals = []
+        client.outbox = {"wire": {"clientMutationId": "pending-action", "ciphertext": "immutable"}}
+        client.workflow = {"action": "pending-workflow"}
+        original_outbox = deepcopy(client.outbox)
+        original_workflow = deepcopy(client.workflow)
+
+        class Socket:
+            closed = False
+            close_code = 4003 if retry_after else 1000
+
+            async def receive(self):
+                now[0] += 301
+                client._retry_not_before = now[0] + cooldown
+                return SimpleNamespace(type=aiohttp.WSMsgType.CLOSE, extra="")
+
+            async def close(self):
+                self.closed = True
+
+        socket = Socket()
+
+        async def websocket():
+            attempts.append(True)
+            if len(attempts) <= 6:
+                raise aiohttp.ClientConnectionError("offline")
+            return socket
+
+        async def ensure_session(*, force=False):
+            renewals.append(force)
+            raise PackInApiError("rate_limited", 429, retry_after)
+
+        async def sleep(delay):
+            waits.append(delay)
+            now[0] += delay
+            if len(waits) == 7:
+                client._stopping = True
+
+        client.api.websocket = websocket
+        client.api.ensure_session = ensure_session
+        monkeypatch.setattr(client_module, "time", SimpleNamespace(monotonic=lambda: now[0]))
+        monkeypatch.setattr(client_module, "asyncio", SimpleNamespace(sleep=sleep, TimeoutError=asyncio.TimeoutError))
+        monkeypatch.setattr(client_module, "random", SimpleNamespace(uniform=lambda _low, _high: 1.0))
+        try:
+            await client._connect_loop()
+            assert waits == [5, 15, 30, 60, 300, 900, expected]
+            assert len(attempts) == 7
+            assert renewals == ([True] if retry_after else [])
+            assert socket.closed and client._ws is None
+            assert client.outbox == original_outbox
+            assert client.workflow == original_workflow
+            assert denied == []
         finally:
             await session.close()
 

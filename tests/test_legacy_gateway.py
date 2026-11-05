@@ -30,7 +30,7 @@ from packin_pure.state import PermissionDenied
 def loopback_transport_only(request):
     import importlib.util
 
-    if importlib.util.find_spec("pytest_homeassistant_custom_component") is not None:
+    if importlib.util.find_spec("pytest_homeassistant") is not None:
         request.getfixturevalue("socket_enabled")
         import pytest_socket
 
